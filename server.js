@@ -504,8 +504,9 @@ app.get('/', (req, res) => {
           .connected { background: #065f46; color: #6ee7b7; border: 1px solid #10b981; }
           .qr_ready { background: #854d0e; color: #fef08a; border: 1px solid #facc15; }
           .disconnected { background: #991b1b; color: #fca5a5; border: 1px solid #ef4444; }
-          .btn { display: inline-block; padding: 10px 18px; background: #0284c7; color: white; text-decoration: none; border-radius: 8px; margin: 8px; font-weight: 600; cursor: pointer; border: none; }
+          .btn { display: inline-block; padding: 10px 18px; background: #0284c7; color: white; text-decoration: none; border-radius: 8px; margin: 8px; font-weight: 600; cursor: pointer; border: none; font-size: 0.95rem; }
           .btn-emerald { background: #10b981; }
+          .btn-danger { background: #dc2626; }
         </style>
       </head>
       <body>
@@ -516,10 +517,11 @@ app.get('/', (req, res) => {
             Status: 
             <span class="badge ${connectionStatus.toLowerCase()}">${connectionStatus}</span>
           </div>
-          ${botPhoneNumber ? `<p style="color: #38bdf8; font-family: monospace; font-size: 1.1rem; margin-top: 15px;">Connected Phone: +${botPhoneNumber}</p>` : ''}
+          ${botPhoneNumber ? `<p style="color: #38bdf8; font-family: monospace; font-size: 1.15rem; margin-top: 15px;">Connected Bot Phone: <strong>+${botPhoneNumber}</strong></p>` : ''}
           <div style="margin-top: 25px;">
             <a class="btn btn-emerald" href="/qr">📱 Scan QR Code</a>
             <button class="btn" onclick="fetch('/api/check-now', {method: 'POST'}).then(r=>r.json()).then(d=>alert('Audit Triggered: ' + JSON.stringify(d)))">⚡ Run Expiry Check Now</button>
+            ${connectionStatus === 'CONNECTED' ? `<button class="btn btn-danger" onclick="if(confirm('Are you sure you want to change the sender bot account? This will unlink +${botPhoneNumber} and generate a new QR code.')){ fetch('/api/logout', {method: 'POST'}).then(() => window.location='/qr'); }">🔄 Change / Unlink Bot Number</button>` : ''}
           </div>
         </div>
       </body>
@@ -535,9 +537,12 @@ app.get('/qr', (req, res) => {
         <head><title>WhatsApp Connected</title><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
         <body style="font-family: sans-serif; background: #0b1120; color: #f8fafc; padding: 40px; text-align: center;">
           <h2 style="color: #10b981;">✅ WhatsApp Connected Successfully!</h2>
-          <p>Linked Phone Number: <strong>+${botPhoneNumber}</strong></p>
-          <p>The service is actively monitoring Firestore batches and listening for YES/NO replies.</p>
-          <a href="/" style="color: #38bdf8; text-decoration: none;">&larr; Back to Dashboard</a>
+          <p>Linked Sender Phone Number: <strong style="font-size: 1.2rem; color: #38bdf8;">+${botPhoneNumber}</strong></p>
+          <p style="color: #94a3b8;">The bot is currently active, sending expiry alerts and processing YES/NO stock reviews.</p>
+          <div style="margin-top: 30px;">
+            <a href="/" style="display: inline-block; padding: 10px 20px; background: #0284c7; color: white; text-decoration: none; border-radius: 8px; margin: 8px; font-weight: bold;">&larr; Back to Dashboard</a>
+            <button onclick="if(confirm('Do you want to unlink +${botPhoneNumber} and pair a different phone number?')){ fetch('/api/logout', {method: 'POST'}).then(() => window.location.reload()); }" style="display: inline-block; padding: 10px 20px; background: #dc2626; color: white; border: none; border-radius: 8px; margin: 8px; font-weight: bold; cursor: pointer;">🔄 Change / Pair Different Number</button>
+          </div>
         </body>
       </html>
     `);
@@ -592,6 +597,47 @@ app.get('/api/status', (req, res) => {
     botPhoneNumber,
     hasQr: Boolean(latestQrDataUrl)
   });
+});
+
+app.post('/api/logout', async (req, res) => {
+  try {
+    console.log(`🔄 [WhatsApp Logout] Changing/Unlinking current bot account (+${botPhoneNumber})...`);
+
+    if (sock) {
+      try {
+        await sock.logout();
+      } catch (e) {
+        try { sock.end(); } catch (err) {}
+      }
+      sock = null;
+    }
+
+    connectionStatus = 'DISCONNECTED';
+    latestQrDataUrl = null;
+    botPhoneNumber = null;
+
+    // 1. Wipe local session directory
+    if (fs.existsSync(AUTH_DIR)) {
+      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+      fs.mkdirSync(AUTH_DIR, { recursive: true });
+      console.log('🗑️ [Session] Local auth directory cleared.');
+    }
+
+    // 2. Wipe Firestore session backup
+    const db = getDb();
+    if (db) {
+      await db.collection('whatsapp_session').doc('backup').delete().catch(() => {});
+      console.log('🗑️ [Session] Firestore session backup cleared.');
+    }
+
+    // 3. Immediately reinitialize connection so new QR is generated
+    setTimeout(connectToWhatsApp, 1500);
+
+    res.json({ success: true, message: 'Bot account unlinked. New QR code is ready.' });
+  } catch (err) {
+    console.error('❌ Error during logout/unlink:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 app.post('/api/check-now', async (req, res) => {
