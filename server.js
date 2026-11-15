@@ -151,7 +151,6 @@ async function connectToWhatsApp() {
         const remoteJid = msg.key.remoteJid || '';
         if (remoteJid.includes('@g.us')) continue; // Ignore groups
 
-        const senderPhone = remoteJid.replace('@s.whatsapp.net', '');
         const text = (
           msg.message.conversation ||
           msg.message.extendedTextMessage?.text ||
@@ -161,8 +160,7 @@ async function connectToWhatsApp() {
 
         if (!text) continue;
 
-        console.log(`📩 [WhatsApp Received] From: +${senderPhone} | Message: "${text}"`);
-        await handleIncomingReply(senderPhone, text, remoteJid);
+        await handleIncomingReply(text, remoteJid);
       }
     });
 
@@ -250,9 +248,46 @@ function getMilestoneDescription(milestone, days) {
 }
 
 /**
+ * Resolve phone number from JID (handles normal phone JIDs and WhatsApp privacy @lid)
+ */
+function resolvePhoneFromJid(jid) {
+  if (!jid) return '';
+  const rawId = jid.split('@')[0].split(':')[0];
+
+  if (jid.includes('@lid')) {
+    try {
+      const reverseMapPath = path.join(AUTH_DIR, `lid-mapping-${rawId}_reverse.json`);
+      if (fs.existsSync(reverseMapPath)) {
+        const rawPhone = JSON.parse(fs.readFileSync(reverseMapPath, 'utf8'));
+        if (rawPhone) return cleanPhoneNumber(rawPhone);
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  return cleanPhoneNumber(rawId);
+}
+
+function getLidForPhone(phone) {
+  const cleaned = cleanPhoneNumber(phone);
+  if (!cleaned) return null;
+  try {
+    const mapPath = path.join(AUTH_DIR, `lid-mapping-${cleaned}.json`);
+    if (fs.existsSync(mapPath)) {
+      const rawLid = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
+      if (rawLid) return String(rawLid).trim();
+    }
+  } catch (e) {
+    // ignore
+  }
+  return null;
+}
+
+/**
  * Handle Two-Way Replies ("YES" or "NO")
  */
-async function handleIncomingReply(senderPhone, text, remoteJid) {
+async function handleIncomingReply(text, remoteJid) {
   const db = getDb();
   if (!db) {
     console.error('❌ Firestore not initialized.');
@@ -261,14 +296,21 @@ async function handleIncomingReply(senderPhone, text, remoteJid) {
 
   // 1. Fetch Target WhatsApp Numbers from Firestore settings
   const targetNumbers = await getTargetPhoneNumbers(db);
-  const cleanedSender = cleanPhoneNumber(senderPhone);
+  const resolvedPhone = resolvePhoneFromJid(remoteJid);
+  const rawId = remoteJid.split('@')[0].split(':')[0];
 
-  const isAuthorized = targetNumbers.length === 0 || targetNumbers.some(num => 
-    cleanedSender === num || cleanedSender.endsWith(num) || num.endsWith(cleanedSender)
-  );
+  console.log(`📩 [WhatsApp Received] From: ${remoteJid} (Phone: +${resolvedPhone}) | Message: "${text}"`);
+
+  // Validate sender authorization
+  const isAuthorized = targetNumbers.length === 0 || targetNumbers.some(target => {
+    if (resolvedPhone === target || resolvedPhone.endsWith(target) || target.endsWith(resolvedPhone)) return true;
+    const knownLid = getLidForPhone(target);
+    if (knownLid && (rawId === knownLid || rawId.endsWith(knownLid))) return true;
+    return false;
+  });
 
   if (!isAuthorized) {
-    console.log(`ℹ️ [Ignored] Message received from non-target number: ${cleanedSender}`);
+    console.log(`ℹ️ [Ignored] Message received from non-target identifier: ${rawId} (Resolved: ${resolvedPhone})`);
     return;
   }
 
@@ -277,7 +319,11 @@ async function handleIncomingReply(senderPhone, text, remoteJid) {
   const isYes = /^(YES|Y|KEEP|STILL\s+IN\s+STOCK|AVAILABLE|OW)$/i.test(normalized) || normalized.startsWith('YES');
 
   // Look up target batch from active alert context or query most critical batch
-  let targetBatch = activeBatchAlerts.get(cleanedSender);
+  let targetBatch = activeBatchAlerts.get(resolvedPhone) || activeBatchAlerts.get(rawId);
+
+  if (!targetBatch && activeBatchAlerts.size === 1) {
+    targetBatch = Array.from(activeBatchAlerts.values())[0];
+  }
 
   if (!targetBatch) {
     // Fallback: Query nearest expiring batch from Firestore
@@ -307,7 +353,8 @@ async function handleIncomingReply(senderPhone, text, remoteJid) {
       await db.collection('stock_batches').doc(targetBatch.batchId).delete();
       console.log(`🗑️ [Batch Deleted] Successfully deleted batch ${targetBatch.batchId} (${targetBatch.itemName}) from Firestore.`);
 
-      activeBatchAlerts.delete(cleanedSender);
+      activeBatchAlerts.delete(resolvedPhone);
+      activeBatchAlerts.delete(rawId);
 
       const replyText = `✅ *Removed from Active Tracking:*
 *${targetBatch.itemName}* (Exp: ${expDateStr}) has been cleared from store stock batches.
@@ -319,7 +366,8 @@ No further expiry warnings will be sent. Master shelf QR code remains intact for
     }
   } else if (isYes) {
     // KEEP BATCH ACTIVE
-    activeBatchAlerts.delete(cleanedSender);
+    activeBatchAlerts.delete(resolvedPhone);
+    activeBatchAlerts.delete(rawId);
 
     const replyText = `👍 *Kept Active:*
 *${targetBatch.itemName}* (Exp: ${expDateStr}) remains active in store tracking.
@@ -397,12 +445,17 @@ _Ration Store Expiry Tracking System_`;
             await sock.sendMessage(targetJid, { text: alertMessage });
             console.log(`📤 [Alert Sent] To +${targetPhone} for ${batch.itemName} (Milestone: ${milestone})`);
 
-            // Save active context for reply handling
-            activeBatchAlerts.set(targetPhone, {
+            // Save active context for reply handling (under both Phone and Privacy LID)
+            const alertCtx = {
               batchId,
               itemName: batch.itemName,
               expiryDate: batch.expiryDate
-            });
+            };
+            activeBatchAlerts.set(targetPhone, alertCtx);
+            const knownLid = getLidForPhone(targetPhone);
+            if (knownLid) {
+              activeBatchAlerts.set(knownLid, alertCtx);
+            }
           }
 
           // Update Firestore batch document with last alerted milestone
