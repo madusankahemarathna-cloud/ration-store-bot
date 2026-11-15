@@ -174,6 +174,82 @@ async function connectToWhatsApp() {
 }
 
 /**
+ * Fetch all registered target WhatsApp numbers from settings/config
+ */
+async function getTargetPhoneNumbers(db) {
+  try {
+    const configDoc = await db.collection('settings').doc('config').get();
+    if (!configDoc.exists) return [];
+    const data = configDoc.data() || {};
+    const numbers = [];
+
+    if (Array.isArray(data.targetWhatsAppNumbers) && data.targetWhatsAppNumbers.length > 0) {
+      data.targetWhatsAppNumbers.forEach(p => {
+        const cleaned = cleanPhoneNumber(p);
+        if (cleaned && !numbers.includes(cleaned)) numbers.push(cleaned);
+      });
+    }
+
+    if (numbers.length === 0 && data.targetWhatsAppNumber) {
+      const cleaned = cleanPhoneNumber(data.targetWhatsAppNumber);
+      if (cleaned && !numbers.includes(cleaned)) numbers.push(cleaned);
+    }
+
+    return numbers;
+  } catch (err) {
+    console.error('❌ Error fetching target phone numbers:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Calculate Expiry Alert Milestone (3m, 2m, 1m, 14d, 7d, <=3d)
+ */
+function getAlertMilestone(days, lastAlertSent, isManual = false) {
+  if (days === null) return null;
+
+  let milestone = null;
+
+  if (days <= 3) {
+    if (lastAlertSent !== '3_DAYS') milestone = '3_DAYS';
+  } else if (days <= 7) {
+    if (lastAlertSent !== '7_DAYS' && lastAlertSent !== '3_DAYS') milestone = '7_DAYS';
+  } else if (days <= 14) {
+    if (lastAlertSent !== '14_DAYS' && lastAlertSent !== '7_DAYS' && lastAlertSent !== '3_DAYS') milestone = '14_DAYS';
+  } else if (days <= 30) {
+    if (lastAlertSent !== '30_DAYS' && lastAlertSent !== '14_DAYS' && lastAlertSent !== '7_DAYS' && lastAlertSent !== '3_DAYS') milestone = '30_DAYS';
+  } else if (days <= 60) {
+    if (!['60_DAYS', '30_DAYS', '14_DAYS', '7_DAYS', '3_DAYS'].includes(lastAlertSent)) milestone = '60_DAYS';
+  } else if (days <= 90) {
+    if (!['90_DAYS', '60_DAYS', '30_DAYS', '14_DAYS', '7_DAYS', '3_DAYS'].includes(lastAlertSent)) milestone = '90_DAYS';
+  }
+
+  // If manual test triggered, force alert for current tier if within 90 days
+  if (isManual && !milestone && days <= 90) {
+    if (days <= 3) milestone = '3_DAYS';
+    else if (days <= 7) milestone = '7_DAYS';
+    else if (days <= 14) milestone = '14_DAYS';
+    else if (days <= 30) milestone = '30_DAYS';
+    else if (days <= 60) milestone = '60_DAYS';
+    else milestone = '90_DAYS';
+  }
+
+  return milestone;
+}
+
+function getMilestoneDescription(milestone, days) {
+  if (days < 0) return `⚠️ *ALREADY EXPIRED (${Math.abs(days)} days ago)*`;
+  if (days === 0) return `🚨 *EXPIRES TODAY*`;
+  if (milestone === '3_DAYS') return `🚨 *${days} day(s) remaining (CRITICAL / URGENT)*`;
+  if (milestone === '7_DAYS') return `⚠️ *1 week remaining (${days} days)*`;
+  if (milestone === '14_DAYS') return `⚠️ *2 weeks remaining (${days} days)*`;
+  if (milestone === '30_DAYS') return `📅 *1 month remaining (${days} days)*`;
+  if (milestone === '60_DAYS') return `📅 *2 months remaining (${days} days)*`;
+  if (milestone === '90_DAYS') return `📅 *3 months remaining (${days} days)*`;
+  return `*${days} days remaining*`;
+}
+
+/**
  * Handle Two-Way Replies ("YES" or "NO")
  */
 async function handleIncomingReply(senderPhone, text, remoteJid) {
@@ -183,13 +259,15 @@ async function handleIncomingReply(senderPhone, text, remoteJid) {
     return;
   }
 
-  // 1. Fetch Target WhatsApp Number from Firestore settings
-  const configDoc = await db.collection('settings').doc('config').get();
-  const targetNumber = configDoc.exists ? cleanPhoneNumber(configDoc.data().targetWhatsAppNumber) : '';
-
-  // Validate sender
+  // 1. Fetch Target WhatsApp Numbers from Firestore settings
+  const targetNumbers = await getTargetPhoneNumbers(db);
   const cleanedSender = cleanPhoneNumber(senderPhone);
-  if (targetNumber && cleanedSender !== targetNumber && !cleanedSender.endsWith(targetNumber)) {
+
+  const isAuthorized = targetNumbers.length === 0 || targetNumbers.some(num => 
+    cleanedSender === num || cleanedSender.endsWith(num) || num.endsWith(cleanedSender)
+  );
+
+  if (!isAuthorized) {
     console.log(`ℹ️ [Ignored] Message received from non-target number: ${cleanedSender}`);
     return;
   }
@@ -271,21 +349,12 @@ async function runDailyExpiryAudit(isManual = false) {
     return { count: 0, error: 'Firestore disconnected' };
   }
 
-  // 1. Fetch Target WhatsApp Number from settings/config
-  const configDoc = await db.collection('settings').doc('config').get();
-  if (!configDoc.exists) {
-    console.log('⚠️ [Audit] settings/config document does not exist.');
-    return { count: 0, message: 'settings/config missing' };
+  // 1. Fetch Target WhatsApp Numbers from settings/config
+  const targetNumbers = await getTargetPhoneNumbers(db);
+  if (targetNumbers.length === 0) {
+    console.log('⚠️ [Audit] No target WhatsApp numbers configured in settings/config.');
+    return { count: 0, message: 'targetWhatsAppNumbers empty' };
   }
-
-  const rawPhone = configDoc.data().targetWhatsAppNumber || '';
-  const targetPhone = cleanPhoneNumber(rawPhone);
-  if (!targetPhone) {
-    console.log('⚠️ [Audit] targetWhatsAppNumber is not configured in settings/config.');
-    return { count: 0, message: 'targetWhatsAppNumber empty' };
-  }
-
-  const targetJid = `${targetPhone}@s.whatsapp.net`;
 
   // 2. Fetch all batches from stock_batches collection
   const snapshot = await db.collection('stock_batches').get();
@@ -303,52 +372,43 @@ async function runDailyExpiryAudit(isManual = false) {
 
     if (days === null) continue;
 
-    // Check Milestones:
-    // 30 days (1 month), 7 days (1 week), <= 3 days (3 days alert zone)
-    let milestone = null;
-    if (days === 30 && batch.lastAlertSent !== '30_DAYS') {
-      milestone = '30_DAYS';
-    } else if (days === 7 && batch.lastAlertSent !== '7_DAYS') {
-      milestone = '7_DAYS';
-    } else if (days <= 3 && batch.lastAlertSent !== '3_DAYS') {
-      milestone = '3_DAYS';
-    }
-
-    // Force alert if manual test and <= 30 days
-    if (isManual && !milestone && days <= 30) {
-      milestone = days <= 3 ? '3_DAYS' : (days <= 7 ? '7_DAYS' : '30_DAYS');
-    }
+    // Check Milestones: 3m (90d), 2m (60d), 1m (30d), 14d, 7d, <=3d
+    const milestone = getAlertMilestone(days, batch.lastAlertSent, isManual);
 
     if (milestone) {
       const expDateStr = formatDateString(batch.expiryDate);
-      const dayWord = days < 0 
-        ? `already EXPIRED (${Math.abs(days)} days ago)` 
-        : (days === 0 ? 'TODAY' : `${days} days`);
+      const milestoneDesc = getMilestoneDescription(milestone, days);
 
-      const alertMessage = `⚠️ *EXPIRY ALERT:*
-*${batch.itemName}* (Exp: ${expDateStr}) expires in *${dayWord}*.
+      const alertMessage = `⚠️ *EXPIRY ALERT (RATION STORE):*
+📦 *${batch.itemName}*
+⏳ Expiry Date: *${expDateStr}*
+⏱️ Status: ${milestoneDesc}
 
 Still in stock?
-Reply *YES* to keep, or *NO* to remove.
+Reply *YES* to keep tracking, or *NO* to remove from stock.
 
 _Ration Store Expiry Tracking System_`;
 
       if (connectionStatus === 'CONNECTED' && sock) {
         try {
-          await sock.sendMessage(targetJid, { text: alertMessage });
-          console.log(`📤 [Alert Sent] To +${targetPhone} for ${batch.itemName} (Milestone: ${milestone})`);
+          // Send to ALL configured target phone numbers
+          for (const targetPhone of targetNumbers) {
+            const targetJid = `${targetPhone}@s.whatsapp.net`;
+            await sock.sendMessage(targetJid, { text: alertMessage });
+            console.log(`📤 [Alert Sent] To +${targetPhone} for ${batch.itemName} (Milestone: ${milestone})`);
 
-          // Update Firestore batch document
+            // Save active context for reply handling
+            activeBatchAlerts.set(targetPhone, {
+              batchId,
+              itemName: batch.itemName,
+              expiryDate: batch.expiryDate
+            });
+          }
+
+          // Update Firestore batch document with last alerted milestone
           await db.collection('stock_batches').doc(batchId).update({
             lastAlertSent: milestone,
             lastAlertDate: new Date().toISOString()
-          });
-
-          // Save active context for reply handling
-          activeBatchAlerts.set(targetPhone, {
-            batchId,
-            itemName: batch.itemName,
-            expiryDate: batch.expiryDate
           });
 
           alertsDispatched++;
@@ -361,8 +421,8 @@ _Ration Store Expiry Tracking System_`;
     }
   }
 
-  console.log(`🏁 [Audit Finished] Total alerts dispatched: ${alertsDispatched}`);
-  return { count: alertsDispatched };
+  console.log(`🏁 [Audit Finished] Total alerts dispatched: ${alertsDispatched} (to ${targetNumbers.length} recipients)`);
+  return { count: alertsDispatched, recipients: targetNumbers.length };
 }
 
 // -------------------------------------------------------------
