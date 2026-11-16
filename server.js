@@ -113,6 +113,13 @@ async function connectToWhatsApp() {
         connectionStatus = 'QR_READY';
         latestQrDataUrl = await QRCode.toDataURL(qr, { width: 340, margin: 2 });
         console.log('📲 [WhatsApp QR Ready] Scan QR code from terminal or visit http://localhost:' + PORT + '/qr');
+        if (db) {
+          db.collection('settings').doc('config').set({
+            botStatus: 'DISCONNECTED',
+            botPhoneNumber: null,
+            lastStatusUpdate: new Date().toISOString()
+          }, { merge: true }).catch(() => {});
+        }
       }
 
       if (connection === 'close') {
@@ -122,6 +129,14 @@ async function connectToWhatsApp() {
         connectionStatus = 'DISCONNECTED';
         latestQrDataUrl = null;
         botPhoneNumber = null;
+
+        if (db) {
+          db.collection('settings').doc('config').set({
+            botStatus: 'DISCONNECTED',
+            botPhoneNumber: null,
+            lastDisconnectedAt: new Date().toISOString()
+          }, { merge: true }).catch(() => {});
+        }
 
         if (shouldReconnect) {
           setTimeout(connectToWhatsApp, 5000);
@@ -138,6 +153,14 @@ async function connectToWhatsApp() {
         botPhoneNumber = jid.split(':')[0] || jid.split('@')[0];
         console.log(`✅ [WhatsApp Connected] Service running live on WhatsApp account: +${botPhoneNumber}`);
         backupSessionToFirestore(AUTH_DIR, getDb(), true);
+
+        if (db) {
+          db.collection('settings').doc('config').set({
+            botStatus: 'CONNECTED',
+            botPhoneNumber: botPhoneNumber,
+            lastConnectedAt: new Date().toISOString()
+          }, { merge: true }).catch(() => {});
+        }
       }
     });
 
@@ -623,11 +646,16 @@ app.post('/api/logout', async (req, res) => {
       console.log('🗑️ [Session] Local auth directory cleared.');
     }
 
-    // 2. Wipe Firestore session backup
+    // 2. Wipe Firestore session backup and set botStatus to DISCONNECTED
     const db = getDb();
     if (db) {
       await db.collection('whatsapp_session').doc('backup').delete().catch(() => {});
-      console.log('🗑️ [Session] Firestore session backup cleared.');
+      await db.collection('settings').doc('config').set({
+        botStatus: 'DISCONNECTED',
+        botPhoneNumber: null,
+        lastDisconnectedAt: new Date().toISOString()
+      }, { merge: true }).catch(() => {});
+      console.log('🗑️ [Session] Firestore session backup cleared and botStatus set to DISCONNECTED.');
     }
 
     // 3. Immediately reinitialize connection so new QR is generated
