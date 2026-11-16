@@ -30,6 +30,34 @@ let connectionStatus = 'DISCONNECTED'; // 'DISCONNECTED' | 'CONNECTING' | 'QR_RE
 let latestQrDataUrl = null;
 let botPhoneNumber = null;
 let isConnecting = false;
+let currentSocketId = 0;
+let reconnectTimer = null;
+
+function destroyCurrentSocket() {
+  currentSocketId++;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (sock) {
+    const oldSock = sock;
+    sock = null;
+    try { oldSock.ev.removeAllListeners(); } catch (e) {}
+    try { oldSock.ws?.close(); } catch (e) {}
+    try { oldSock.end(); } catch (e) {}
+  }
+}
+
+function scheduleReconnect(delayMs, force = false) {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectToWhatsApp(force);
+  }, delayMs);
+}
 
 // Track last alerted batch per target phone for direct interactive YES/NO replies
 const activeBatchAlerts = new Map();
@@ -81,58 +109,63 @@ function formatDateString(expiryDateVal) {
 /**
  * Connect to WhatsApp using Baileys WebSockets (100% Free)
  */
-async function connectToWhatsApp() {
-  if (isConnecting) {
-    console.log('⏳ [Baileys] Socket connection already in progress. Skipping duplicate connect call.');
-    return;
-  }
-  if (connectionStatus === 'CONNECTED' && sock) {
-    console.log('✅ [Baileys] WhatsApp is already CONNECTED. Skipping redundant connect call.');
-    return;
+async function connectToWhatsApp(force = false) {
+  if (!force) {
+    if (isConnecting) {
+      console.log('⏳ [Baileys] Socket connection already in progress. Skipping duplicate connect call.');
+      return;
+    }
+    if (sock && (connectionStatus === 'CONNECTED' || connectionStatus === 'QR_READY' || connectionStatus === 'CONNECTING')) {
+      console.log(`ℹ️ [Baileys] Socket already active in state ${connectionStatus}. Skipping duplicate connect call.`);
+      return;
+    }
   }
 
   isConnecting = true;
+  destroyCurrentSocket();
+  const mySocketId = currentSocketId;
   connectionStatus = 'CONNECTING';
   latestQrDataUrl = null;
 
   try {
-    if (sock) {
-      try {
-        sock.ev.removeAllListeners();
-        sock.end();
-      } catch (e) {}
-      sock = null;
-    }
-
     const db = getDb();
     await restoreSessionFromFirestore(AUTH_DIR, db);
+    if (mySocketId !== currentSocketId) return;
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    if (mySocketId !== currentSocketId) return;
+
     const { version } = await fetchLatestBaileysVersion();
+    if (mySocketId !== currentSocketId) return;
 
-    console.log(`🤖 [Baileys] Initializing WhatsApp Socket (v${version.join('.')})...`);
+    console.log(`🤖 [Baileys] Initializing WhatsApp Socket #${mySocketId} (v${version.join('.')})...`);
 
-    sock = makeWASocket({
+    const mySock = makeWASocket({
       version,
       logger: pino({ level: 'silent' }),
       auth: state,
       printQRInTerminal: true,
       browser: ['Ration Store Depot', 'Chrome', '1.0.0']
     });
+    sock = mySock;
 
-    sock.ev.on('creds.update', async () => {
+    mySock.ev.on('creds.update', async () => {
+      if (mySocketId !== currentSocketId) return;
       await saveCreds();
       backupSessionToFirestore(AUTH_DIR, getDb());
     });
 
-    sock.ev.on('connection.update', async (update) => {
+    mySock.ev.on('connection.update', async (update) => {
+      if (mySocketId !== currentSocketId) return;
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        isConnecting = false;
+        const qrData = await QRCode.toDataURL(qr, { width: 340, margin: 2 });
+        if (mySocketId !== currentSocketId) return;
+        latestQrDataUrl = qrData;
         connectionStatus = 'QR_READY';
-        latestQrDataUrl = await QRCode.toDataURL(qr, { width: 340, margin: 2 });
-        console.log('📲 [WhatsApp QR Ready] Scan QR code from terminal or visit http://localhost:' + PORT + '/qr');
+        isConnecting = false;
+        console.log(`📲 [WhatsApp QR Ready] (Socket #${mySocketId}) Scan QR code at /qr`);
         const firestore = db || getDb();
         if (firestore) {
           firestore.collection('settings').doc('config').set({
@@ -144,10 +177,21 @@ async function connectToWhatsApp() {
       }
 
       if (connection === 'close') {
+        if (mySocketId !== currentSocketId) return;
         isConnecting = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-        console.log(`⚠️ [WhatsApp Disconnected] Reason: ${statusCode}. Logged out: ${isLoggedOut}`);
+        const isRestartRequired = statusCode === DisconnectReason.restartRequired || statusCode === 515;
+
+        console.log(`⚠️ [WhatsApp Socket #${mySocketId} Closed] Reason: ${statusCode}. LoggedOut: ${isLoggedOut}, RestartRequired: ${isRestartRequired}`);
+
+        // Right after QR scan, WhatsApp closes the pairing socket with 515 (restartRequired)
+        if (isRestartRequired) {
+          console.log('🔄 [Baileys] Pairing handshake complete (515). Reconnecting immediately with new credentials...');
+          scheduleReconnect(300, true);
+          return;
+        }
+
         connectionStatus = 'DISCONNECTED';
         latestQrDataUrl = null;
         botPhoneNumber = null;
@@ -179,18 +223,19 @@ async function connectToWhatsApp() {
             firestore.collection('whatsapp_session').doc('backup').delete().catch(() => {});
           }
           // Immediately restart socket to generate new QR code for pairing
-          setTimeout(connectToWhatsApp, 1500);
+          scheduleReconnect(1500, true);
         } else {
-          // Reconnect on transient disconnections
-          setTimeout(connectToWhatsApp, 5000);
+          // Reconnect on QR timeout (408) or transient disconnections
+          scheduleReconnect(3000, true);
         }
       } else if (connection === 'open') {
+        if (mySocketId !== currentSocketId) return;
         isConnecting = false;
         connectionStatus = 'CONNECTED';
         latestQrDataUrl = null;
-        const jid = sock.user?.id || '';
+        const jid = mySock.user?.id || '';
         botPhoneNumber = jid.split(':')[0] || jid.split('@')[0];
-        console.log(`✅ [WhatsApp Connected] Service running live on WhatsApp account: +${botPhoneNumber}`);
+        console.log(`✅ [WhatsApp Connected] (Socket #${mySocketId}) Live on WhatsApp account: +${botPhoneNumber}`);
         backupSessionToFirestore(AUTH_DIR, getDb(), true);
 
         const firestore = db || getDb();
@@ -209,7 +254,8 @@ async function connectToWhatsApp() {
     });
 
     // Listen for incoming messages (Two-Way YES / NO reply handling)
-    sock.ev.on('messages.upsert', async (m) => {
+    mySock.ev.on('messages.upsert', async (m) => {
+      if (mySocketId !== currentSocketId) return;
       if (m.type !== 'notify') return;
 
       for (const msg of m.messages) {
@@ -232,9 +278,11 @@ async function connectToWhatsApp() {
     });
 
   } catch (error) {
+    if (mySocketId !== currentSocketId) return;
     console.error('❌ [Baileys Connection Error]:', error);
+    isConnecting = false;
     connectionStatus = 'DISCONNECTED';
-    setTimeout(connectToWhatsApp, 8000);
+    scheduleReconnect(5000, true);
   }
 }
 
@@ -713,7 +761,8 @@ app.get('/qr', (req, res) => {
 app.get('/api/info', (req, res) => {
   res.json({
     app: 'Ration Store WhatsApp Automation Service',
-    version: '2.3.0',
+    version: '2.4.0',
+    socketId: currentSocketId,
     connectionStatus,
     botPhoneNumber,
     hasQr: Boolean(latestQrDataUrl),
@@ -734,13 +783,11 @@ app.post('/api/logout', async (req, res) => {
   try {
     console.log(`🔄 [WhatsApp Logout] Changing/Unlinking current bot account (+${botPhoneNumber})...`);
 
-    if (sock) {
-      try {
-        await sock.logout();
-      } catch (e) {
-        try { sock.end(); } catch (err) {}
-      }
-      sock = null;
+    const oldSock = sock;
+    isConnecting = false;
+    destroyCurrentSocket();
+    if (oldSock) {
+      try { await oldSock.logout(); } catch (e) {}
     }
 
     connectionStatus = 'DISCONNECTED';
@@ -760,14 +807,14 @@ app.post('/api/logout', async (req, res) => {
       await db.collection('whatsapp_session').doc('backup').delete().catch(() => {});
       await db.collection('settings').doc('config').set({
         botStatus: 'DISCONNECTED',
-        botPhoneNumber: null,
+        botPhoneNumber: '',
         lastDisconnectedAt: new Date().toISOString()
       }, { merge: true }).catch(() => {});
       console.log('🗑️ [Session] Firestore session backup cleared and botStatus set to DISCONNECTED.');
     }
 
     // 3. Immediately reinitialize connection so new QR is generated
-    setTimeout(connectToWhatsApp, 1500);
+    scheduleReconnect(1000, true);
 
     res.json({ success: true, message: 'Bot account unlinked. New QR code is ready.' });
   } catch (err) {
