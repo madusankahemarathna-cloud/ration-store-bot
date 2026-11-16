@@ -124,8 +124,8 @@ async function connectToWhatsApp() {
 
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log(`⚠️ [WhatsApp Disconnected] Reason: ${statusCode}. Reconnecting: ${shouldReconnect}`);
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+        console.log(`⚠️ [WhatsApp Disconnected] Reason: ${statusCode}. Logged out: ${isLoggedOut}`);
         connectionStatus = 'DISCONNECTED';
         latestQrDataUrl = null;
         botPhoneNumber = null;
@@ -138,13 +138,24 @@ async function connectToWhatsApp() {
           }, { merge: true }).catch(() => {});
         }
 
-        if (shouldReconnect) {
-          setTimeout(connectToWhatsApp, 5000);
-        } else {
-          console.log('❌ Device logged out. Clearing session.');
+        if (isLoggedOut) {
+          console.log('❌ Device logged out. Clearing local session and Firestore backup, then restarting for fresh QR...');
+          if (fs.existsSync(AUTH_DIR)) {
+            try {
+              fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+              fs.mkdirSync(AUTH_DIR, { recursive: true });
+            } catch (err) {
+              console.error('Error clearing AUTH_DIR:', err.message);
+            }
+          }
           if (db) {
             db.collection('whatsapp_session').doc('backup').delete().catch(() => {});
           }
+          // Immediately restart socket to generate new QR code for pairing
+          setTimeout(connectToWhatsApp, 2000);
+        } else {
+          // Reconnect on transient disconnections
+          setTimeout(connectToWhatsApp, 5000);
         }
       } else if (connection === 'open') {
         connectionStatus = 'CONNECTED';
@@ -558,7 +569,7 @@ app.get('/qr', (req, res) => {
       <!DOCTYPE html>
       <html>
         <head><title>WhatsApp Connected</title><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
-        <body style="font-family: sans-serif; background: #0b1120; color: #f8fafc; padding: 40px; text-align: center;">
+        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b1120; color: #f8fafc; padding: 40px; text-align: center;">
           <h2 style="color: #10b981;">✅ WhatsApp Connected Successfully!</h2>
           <p>Linked Sender Phone Number: <strong style="font-size: 1.2rem; color: #38bdf8;">+${botPhoneNumber}</strong></p>
           <p style="color: #94a3b8;">The bot is currently active, sending expiry alerts and processing YES/NO stock reviews.</p>
@@ -571,14 +582,36 @@ app.get('/qr', (req, res) => {
     `);
   }
 
+  // If bot is not connected and no QR is generated yet, ensure socket is connecting
+  if (!latestQrDataUrl && connectionStatus !== 'CONNECTING') {
+    console.log('📲 [/qr accessed] No active QR and not connecting. Triggering connectToWhatsApp()...');
+    connectToWhatsApp();
+  }
+
   if (!latestQrDataUrl) {
     return res.send(`
       <!DOCTYPE html>
       <html>
-        <head><title>Generating QR...</title><meta http-equiv="refresh" content="3"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
-        <body style="font-family: sans-serif; background: #0b1120; color: #f8fafc; padding: 40px; text-align: center;">
-          <h2>Generating WhatsApp QR Code...</h2>
-          <p style="color: #94a3b8;">Please wait, auto-refreshing in 3 seconds...</p>
+        <head>
+          <title>Generating QR...</title>
+          <meta http-equiv="refresh" content="3">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <script>
+            setTimeout(function() {
+              window.location.reload();
+            }, 3000);
+          </script>
+        </head>
+        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b1120; color: #f8fafc; padding: 40px; text-align: center;">
+          <div style="max-width: 400px; margin: 40px auto; background: #1e293b; padding: 30px; border-radius: 16px; border: 1px solid #334155;">
+            <div style="display: inline-block; width: 40px; height: 40px; border: 4px solid #334155; border-top-color: #38bdf8; border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 20px;"></div>
+            <h2 style="margin: 0 0 10px 0; color: #38bdf8;">Generating WhatsApp QR Code...</h2>
+            <p style="color: #94a3b8; font-size: 0.95rem; line-height: 1.5;">Connecting to WhatsApp servers. This page will refresh automatically...</p>
+            <button onclick="window.location.reload()" style="margin-top: 15px; padding: 8px 16px; background: #334155; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.85rem;">🔄 Tap to Reload</button>
+          </div>
+          <style>
+            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+          </style>
         </body>
       </html>
     `);
@@ -591,23 +624,30 @@ app.get('/qr', (req, res) => {
         <title>Pair WhatsApp - Ration Store</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <meta http-equiv="refresh" content="25">
+        <script>
+          setTimeout(function() {
+            window.location.reload();
+          }, 25000);
+        </script>
         <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b1120; color: #f8fafc; padding: 25px; text-align: center; }
-          .qr-box { max-width: 440px; margin: 0 auto; background: #1e293b; padding: 25px; border-radius: 16px; border: 1px solid #334155; }
-          img { border-radius: 10px; background: white; padding: 10px; max-width: 100%; }
-          ol { text-align: left; color: #94a3b8; font-size: 0.9rem; line-height: 1.6; }
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b1120; color: #f8fafc; padding: 20px; text-align: center; }
+          .qr-box { max-width: 440px; margin: 0 auto; background: #1e293b; padding: 20px; border-radius: 16px; border: 1px solid #334155; }
+          img { border-radius: 10px; background: white; padding: 10px; max-width: 280px; width: 100%; height: auto; display: block; margin: 0 auto; }
+          ol { text-align: left; color: #94a3b8; font-size: 0.88rem; line-height: 1.6; padding-left: 20px; }
+          .btn-refresh { display: inline-block; margin-top: 12px; padding: 8px 16px; background: #0284c7; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600; text-decoration: none; }
         </style>
       </head>
       <body>
         <div class="qr-box">
-          <h2 style="margin-top: 0;">📱 Link WhatsApp Device</h2>
+          <h2 style="margin-top: 0; color: #10b981; font-size: 1.3rem;">📱 Link WhatsApp Device</h2>
           <img src="${latestQrDataUrl}" alt="WhatsApp QR Code" />
           <ol>
-            <li>Open <strong>WhatsApp</strong> on your mobile phone.</li>
-            <li>Tap <strong>Settings</strong> or <strong>Menu (3 dots)</strong> &rarr; <strong>Linked Devices</strong>.</li>
-            <li>Tap <strong>Link a Device</strong> and point camera at this QR code.</li>
+            <li>Open <strong>WhatsApp</strong> on the Bot Phone.</li>
+            <li>Tap <strong>Settings</strong> or <strong>Menu (⋮)</strong> &rarr; <strong>Linked Devices</strong>.</li>
+            <li>Tap <strong>Link a Device</strong> and scan this QR code.</li>
           </ol>
-          <p style="font-size: 0.75rem; color: #64748b;">Page refreshes automatically. Zero API costs.</p>
+          <button class="btn-refresh" onclick="window.location.reload()">🔄 Refresh QR Code</button>
+          <p style="font-size: 0.75rem; color: #64748b; margin-top: 10px;">Refreshes every 25 seconds automatically.</p>
         </div>
       </body>
     </html>
