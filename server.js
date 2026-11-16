@@ -91,25 +91,51 @@ async function saveAlertQueue(db, queue) {
   }
 }
 
+function formatDisplayDate(expiryDateVal) {
+  const iso = formatDateString(expiryDateVal);
+  if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return iso;
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const [y, m, d] = iso.split('-').map(Number);
+  const dd = String(d).padStart(2, '0');
+  const mmm = months[m - 1] || String(m).padStart(2, '0');
+  return `${dd}/${mmm}/${y}`;
+}
+
+function getColorTheme(days) {
+  if (days <= 3) {
+    return { bar: '🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥', dot: '🔴' };
+  } else if (days <= 14) {
+    return { bar: '🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧', dot: '🟠' };
+  } else if (days <= 30) {
+    return { bar: '🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨', dot: '🟡' };
+  } else {
+    return { bar: '🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩', dot: '🟢' };
+  }
+}
+
+function formatRemainingDaysValue(days) {
+  if (days === null || days === undefined) return '--';
+  if (days < 0) return `00 (Expired ${String(Math.abs(days)).padStart(2, '0')}d ago)`;
+  return String(days).padStart(2, '0');
+}
+
 function formatQueueAlertMessage(item, remainingAfterThis, isNext = false) {
-  const countLabel = item.total ? ` (${item.index} of ${item.total})` : '';
-  const headerTitle = isNext
-    ? `⚠️ *NEXT EXPIRY ALERT${countLabel} — RATION STORE:*`
-    : `⚠️ *EXPIRY ALERT${countLabel} — RATION STORE:*`;
+  const days = item.days !== undefined ? item.days : getDaysRemaining(item.expiryDate);
+  const { bar, dot } = getColorTheme(days);
+  const countLabel = item.total && item.total > 1 ? ` (${item.index}/${item.total})` : '';
+  const displayDate = formatDisplayDate(item.expiryDate);
+  const remainingStr = formatRemainingDaysValue(days);
 
   const queueFooter = remainingAfterThis > 0
-    ? `\n⏳ _(${remainingAfterThis} more expiring item(s) waiting in queue — reply YES or NO to receive the next item)_`
+    ? `\n\n⏳ _(${remainingAfterThis} more item(s) waiting in queue)_`
     : '';
 
-  return `${headerTitle}
-📦 *${item.itemName}*
-⏳ Expiry Date: *${item.expiryDate}*
-⏱️ Status: ${item.milestoneDesc}
-
-Still in stock?
-Reply *YES* to keep tracking, or *NO* to remove from stock.${queueFooter}
-
-_Ration Store Expiry Tracking System_`;
+  return `${bar}
+${dot} *E̲X̲P̲I̲R̲Y̲ A̲L̲E̲R̲T̲*${countLabel}
+✓ Item – *${item.itemName}*
+✓ Expiry Date – *${displayDate}*
+✓ Remaining days – *${remainingStr}*
+✓ Still in stock? Reply *YES* or *NO*${queueFooter}`;
 }
 
 async function dispatchNextFromQueue(db, targetNumbers, isNext = false) {
@@ -567,7 +593,7 @@ async function handleIncomingReply(text, remoteJid) {
     return;
   }
 
-  const expDateStr = formatDateString(targetBatch.expiryDate);
+  const expDateStr = formatDisplayDate(targetBatch.expiryDate);
   const progressLabel = targetBatch.total ? ` (${targetBatch.index}/${targetBatch.total})` : '';
 
   if (isNo) {
@@ -896,7 +922,7 @@ app.get('/qr', (req, res) => {
 app.get('/api/info', (req, res) => {
   res.json({
     app: 'Ration Store WhatsApp Automation Service',
-    version: '2.5.0',
+    version: '2.6.0',
     socketId: currentSocketId,
     connectionStatus,
     botPhoneNumber,
