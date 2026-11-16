@@ -29,6 +29,7 @@ let sock = null;
 let connectionStatus = 'DISCONNECTED'; // 'DISCONNECTED' | 'CONNECTING' | 'QR_READY' | 'CONNECTED'
 let latestQrDataUrl = null;
 let botPhoneNumber = null;
+let isConnecting = false;
 
 // Track last alerted batch per target phone for direct interactive YES/NO replies
 const activeBatchAlerts = new Map();
@@ -81,10 +82,28 @@ function formatDateString(expiryDateVal) {
  * Connect to WhatsApp using Baileys WebSockets (100% Free)
  */
 async function connectToWhatsApp() {
+  if (isConnecting) {
+    console.log('⏳ [Baileys] Socket connection already in progress. Skipping duplicate connect call.');
+    return;
+  }
+  if (connectionStatus === 'CONNECTED' && sock) {
+    console.log('✅ [Baileys] WhatsApp is already CONNECTED. Skipping redundant connect call.');
+    return;
+  }
+
+  isConnecting = true;
   connectionStatus = 'CONNECTING';
   latestQrDataUrl = null;
 
   try {
+    if (sock) {
+      try {
+        sock.ev.removeAllListeners();
+        sock.end();
+      } catch (e) {}
+      sock = null;
+    }
+
     const db = getDb();
     await restoreSessionFromFirestore(AUTH_DIR, db);
 
@@ -110,6 +129,7 @@ async function connectToWhatsApp() {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
+        isConnecting = false;
         connectionStatus = 'QR_READY';
         latestQrDataUrl = await QRCode.toDataURL(qr, { width: 340, margin: 2 });
         console.log('📲 [WhatsApp QR Ready] Scan QR code from terminal or visit http://localhost:' + PORT + '/qr');
@@ -124,6 +144,7 @@ async function connectToWhatsApp() {
       }
 
       if (connection === 'close') {
+        isConnecting = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = statusCode === DisconnectReason.loggedOut;
         console.log(`⚠️ [WhatsApp Disconnected] Reason: ${statusCode}. Logged out: ${isLoggedOut}`);
@@ -158,12 +179,13 @@ async function connectToWhatsApp() {
             firestore.collection('whatsapp_session').doc('backup').delete().catch(() => {});
           }
           // Immediately restart socket to generate new QR code for pairing
-          setTimeout(connectToWhatsApp, 2000);
+          setTimeout(connectToWhatsApp, 1500);
         } else {
           // Reconnect on transient disconnections
           setTimeout(connectToWhatsApp, 5000);
         }
       } else if (connection === 'open') {
+        isConnecting = false;
         connectionStatus = 'CONNECTED';
         latestQrDataUrl = null;
         const jid = sock.user?.id || '';
@@ -605,19 +627,25 @@ app.get('/qr', (req, res) => {
       <html>
         <head>
           <title>Generating QR...</title>
-          <meta http-equiv="refresh" content="3">
+          <meta http-equiv="refresh" content="5">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
           <script>
-            setTimeout(function() {
-              window.location.reload();
-            }, 3000);
+            setInterval(async function() {
+              try {
+                const r = await fetch('/api/status');
+                const data = await r.json();
+                if (data.status === 'CONNECTED' || data.hasQr) {
+                  window.location.reload();
+                }
+              } catch (e) {}
+            }, 2000);
           </script>
         </head>
         <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b1120; color: #f8fafc; padding: 40px; text-align: center;">
           <div style="max-width: 400px; margin: 40px auto; background: #1e293b; padding: 30px; border-radius: 16px; border: 1px solid #334155;">
             <div style="display: inline-block; width: 40px; height: 40px; border: 4px solid #334155; border-top-color: #38bdf8; border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 20px;"></div>
             <h2 style="margin: 0 0 10px 0; color: #38bdf8;">Generating WhatsApp QR Code...</h2>
-            <p style="color: #94a3b8; font-size: 0.95rem; line-height: 1.5;">Connecting to WhatsApp servers. This page will refresh automatically...</p>
+            <p style="color: #94a3b8; font-size: 0.95rem; line-height: 1.5;">Connecting to WhatsApp servers. This page will refresh automatically as soon as ready...</p>
             <div style="margin-top: 15px;">
               <button onclick="window.location.reload()" style="padding: 8px 16px; background: #334155; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.85rem; margin-right: 8px;">🔄 Tap to Reload</button>
               <button onclick="if(confirm('Reset WhatsApp session to force an immediate new QR code?')){ fetch('/api/logout', {method:'POST'}).then(function(){ setTimeout(function(){ window.location.reload(); }, 1500); }); }" style="padding: 8px 16px; background: #dc2626; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: bold;">⚡ Reset Session</button>
@@ -637,11 +665,21 @@ app.get('/qr', (req, res) => {
       <head>
         <title>Pair WhatsApp - Ration Store</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <meta http-equiv="refresh" content="25">
         <script>
-          setTimeout(function() {
-            window.location.reload();
-          }, 25000);
+          let lastQr = "${latestQrDataUrl}";
+          setInterval(async function() {
+            try {
+              const r = await fetch('/api/status');
+              const data = await r.json();
+              if (data.status === 'CONNECTED') {
+                window.location.reload();
+              } else if (data.qrDataUrl && data.qrDataUrl !== lastQr) {
+                lastQr = data.qrDataUrl;
+                const img = document.getElementById('qr-img');
+                if (img) img.src = data.qrDataUrl;
+              }
+            } catch (e) {}
+          }, 2000);
         </script>
         <style>
           body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b1120; color: #f8fafc; padding: 20px; text-align: center; }
@@ -655,7 +693,7 @@ app.get('/qr', (req, res) => {
       <body>
         <div class="qr-box">
           <h2 style="margin-top: 0; color: #10b981; font-size: 1.3rem;">📱 Link WhatsApp Device</h2>
-          <img src="${latestQrDataUrl}" alt="WhatsApp QR Code" />
+          <img id="qr-img" src="${latestQrDataUrl}" alt="WhatsApp QR Code" />
           <ol>
             <li>Open <strong>WhatsApp</strong> on the Bot Phone.</li>
             <li>Tap <strong>Settings</strong> or <strong>Menu (⋮)</strong> &rarr; <strong>Linked Devices</strong>.</li>
@@ -665,7 +703,7 @@ app.get('/qr', (req, res) => {
             <button class="btn-refresh" onclick="window.location.reload()">🔄 Refresh QR Code</button>
             <button class="btn-reset" onclick="if(confirm('Generate a brand new QR code?')){ fetch('/api/logout', {method:'POST'}).then(function(){ setTimeout(function(){ window.location.reload(); }, 1500); }); }">⚡ Force Fresh QR</button>
           </div>
-          <p style="font-size: 0.75rem; color: #64748b; margin-top: 10px;">Refreshes every 25 seconds automatically.</p>
+          <p style="font-size: 0.75rem; color: #64748b; margin-top: 10px;">Auto-syncs live every 2 seconds. Never expires.</p>
         </div>
       </body>
     </html>
@@ -675,7 +713,7 @@ app.get('/qr', (req, res) => {
 app.get('/api/info', (req, res) => {
   res.json({
     app: 'Ration Store WhatsApp Automation Service',
-    version: '2.2.0',
+    version: '2.3.0',
     connectionStatus,
     botPhoneNumber,
     hasQr: Boolean(latestQrDataUrl),
@@ -687,7 +725,8 @@ app.get('/api/status', (req, res) => {
   res.json({
     status: connectionStatus,
     botPhoneNumber,
-    hasQr: Boolean(latestQrDataUrl)
+    hasQr: Boolean(latestQrDataUrl),
+    qrDataUrl: latestQrDataUrl
   });
 });
 
