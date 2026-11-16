@@ -61,6 +61,108 @@ function scheduleReconnect(delayMs, force = false) {
 
 // Track last alerted batch per target phone for direct interactive YES/NO replies
 const activeBatchAlerts = new Map();
+let pendingAlertQueue = [];
+
+async function loadAlertQueue(db) {
+  if (pendingAlertQueue.length > 0) return pendingAlertQueue;
+  if (!db) return [];
+  try {
+    const doc = await db.collection('settings').doc('alert_queue').get();
+    if (doc.exists && Array.isArray(doc.data()?.queue)) {
+      pendingAlertQueue = doc.data().queue;
+      return pendingAlertQueue;
+    }
+  } catch (err) {
+    console.error('❌ Error loading alert queue from Firestore:', err.message);
+  }
+  return [];
+}
+
+async function saveAlertQueue(db, queue) {
+  pendingAlertQueue = Array.isArray(queue) ? queue : [];
+  if (!db) return;
+  try {
+    await db.collection('settings').doc('alert_queue').set({
+      queue: pendingAlertQueue,
+      updatedAt: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('❌ Error saving alert queue to Firestore:', err.message);
+  }
+}
+
+function formatQueueAlertMessage(item, remainingAfterThis, isNext = false) {
+  const countLabel = item.total ? ` (${item.index} of ${item.total})` : '';
+  const headerTitle = isNext
+    ? `⚠️ *NEXT EXPIRY ALERT${countLabel} — RATION STORE:*`
+    : `⚠️ *EXPIRY ALERT${countLabel} — RATION STORE:*`;
+
+  const queueFooter = remainingAfterThis > 0
+    ? `\n⏳ _(${remainingAfterThis} more expiring item(s) waiting in queue — reply YES or NO to receive the next item)_`
+    : '';
+
+  return `${headerTitle}
+📦 *${item.itemName}*
+⏳ Expiry Date: *${item.expiryDate}*
+⏱️ Status: ${item.milestoneDesc}
+
+Still in stock?
+Reply *YES* to keep tracking, or *NO* to remove from stock.${queueFooter}
+
+_Ration Store Expiry Tracking System_`;
+}
+
+async function dispatchNextFromQueue(db, targetNumbers, isNext = false) {
+  await loadAlertQueue(db);
+
+  while (pendingAlertQueue.length > 0) {
+    const item = pendingAlertQueue[0];
+    // Verify batch still exists in Firestore (in case it was deleted in the app)
+    try {
+      const batchDoc = await db.collection('stock_batches').doc(item.batchId).get();
+      if (!batchDoc.exists) {
+        console.log(`ℹ️ [Queue] Batch ${item.batchId} (${item.itemName}) no longer exists. Skipping to next...`);
+        pendingAlertQueue.shift();
+        continue;
+      }
+    } catch (e) {
+      // proceed if transient read error
+    }
+
+    const remainingAfterThis = pendingAlertQueue.length - 1;
+    const alertMessage = formatQueueAlertMessage(item, remainingAfterThis, isNext);
+
+    if (connectionStatus === 'CONNECTED' && sock) {
+      for (const targetPhone of targetNumbers) {
+        const targetJid = `${targetPhone}@s.whatsapp.net`;
+        await sock.sendMessage(targetJid, { text: alertMessage });
+        console.log(`📤 [Queue Alert ${item.index}/${item.total}] Sent to +${targetPhone} for ${item.itemName} (Remaining waiting: ${remainingAfterThis})`);
+
+        activeBatchAlerts.set(targetPhone, item);
+        const knownLid = getLidForPhone(targetPhone);
+        if (knownLid) {
+          activeBatchAlerts.set(knownLid, item);
+        }
+      }
+
+      // Mark milestone on batch document now that its alert has been dispatched
+      await db.collection('stock_batches').doc(item.batchId).update({
+        lastAlertSent: item.milestone,
+        lastAlertDate: new Date().toISOString()
+      }).catch(() => {});
+
+      await saveAlertQueue(db, pendingAlertQueue);
+      return item;
+    } else {
+      console.log(`⚠️ WhatsApp bot not connected. Queue item ${item.itemName} remains waiting.`);
+      await saveAlertQueue(db, pendingAlertQueue);
+      return null;
+    }
+  }
+
+  await saveAlertQueue(db, []);
+  return null;
+}
 
 /**
  * Clean phone number to E.164 international digits (e.g. 94771234567)
@@ -400,7 +502,7 @@ function getLidForPhone(phone) {
 }
 
 /**
- * Handle Two-Way Replies ("YES" or "NO")
+ * Handle Two-Way Replies ("YES" or "NO") with One-by-One Waiting Queue
  */
 async function handleIncomingReply(text, remoteJid) {
   const db = getDb();
@@ -433,8 +535,13 @@ async function handleIncomingReply(text, remoteJid) {
   const isNo = /^(NO|N|REMOVE|FINISH|FINISHED|OUT\s+OF\s+STOCK|CLEAR)$/i.test(normalized) || normalized.startsWith('NO');
   const isYes = /^(YES|Y|KEEP|STILL\s+IN\s+STOCK|AVAILABLE|OW)$/i.test(normalized) || normalized.startsWith('YES');
 
-  // Look up target batch from active alert context or query most critical batch
-  let targetBatch = activeBatchAlerts.get(resolvedPhone) || activeBatchAlerts.get(rawId);
+  // 2. Load One-by-One Waiting Queue first (persisted in Firestore)
+  const queue = await loadAlertQueue(db);
+  let targetBatch = queue.length > 0 ? queue[0] : null;
+
+  if (!targetBatch) {
+    targetBatch = activeBatchAlerts.get(resolvedPhone) || activeBatchAlerts.get(rawId);
+  }
 
   if (!targetBatch && activeBatchAlerts.size === 1) {
     targetBatch = Array.from(activeBatchAlerts.values())[0];
@@ -461,6 +568,7 @@ async function handleIncomingReply(text, remoteJid) {
   }
 
   const expDateStr = formatDateString(targetBatch.expiryDate);
+  const progressLabel = targetBatch.total ? ` (${targetBatch.index}/${targetBatch.total})` : '';
 
   if (isNo) {
     // AUTOMATICALLY DELETE BATCH DOCUMENT FROM FIRESTORE
@@ -471,11 +579,32 @@ async function handleIncomingReply(text, remoteJid) {
       activeBatchAlerts.delete(resolvedPhone);
       activeBatchAlerts.delete(rawId);
 
-      const replyText = `✅ *Removed from Active Tracking:*
-*${targetBatch.itemName}* (Exp: ${expDateStr}) has been cleared from store stock batches.
-No further expiry warnings will be sent. Master shelf QR code remains intact for future stock.`;
+      // Remove current item from front of queue
+      if (queue.length > 0 && queue[0].batchId === targetBatch.batchId) {
+        queue.shift();
+        await saveAlertQueue(db, queue);
+      }
 
-      await sock.sendMessage(remoteJid, { text: replyText });
+      if (queue.length > 0) {
+        const replyText = `✅ *Removed from Stock${progressLabel}:*
+*${targetBatch.itemName}* (Exp: ${expDateStr}) has been cleared from store stock batches.`;
+        await sock.sendMessage(remoteJid, { text: replyText });
+
+        // Immediately send the NEXT item waiting in the queue!
+        const nextSent = await dispatchNextFromQueue(db, targetNumbers, true);
+        if (!nextSent) {
+          await sock.sendMessage(remoteJid, {
+            text: `🎉 *All pending expiry alerts${targetBatch.total ? ` (${targetBatch.total}/${targetBatch.total})` : ''} have been reviewed!*`
+          });
+        }
+      } else {
+        const replyText = `✅ *Removed from Active Tracking${progressLabel}:*
+*${targetBatch.itemName}* (Exp: ${expDateStr}) has been cleared from store stock batches.
+No further expiry warnings will be sent.
+
+🎉 *All pending expiry alerts${targetBatch.total ? ` (${targetBatch.total}/${targetBatch.total})` : ''} have been reviewed!*`;
+        await sock.sendMessage(remoteJid, { text: replyText });
+      }
     } catch (err) {
       console.error('❌ Error deleting batch document:', err);
     }
@@ -484,14 +613,35 @@ No further expiry warnings will be sent. Master shelf QR code remains intact for
     activeBatchAlerts.delete(resolvedPhone);
     activeBatchAlerts.delete(rawId);
 
-    const replyText = `👍 *Kept Active:*
-*${targetBatch.itemName}* (Exp: ${expDateStr}) remains active in store tracking.
-Next reminder will be sent as scheduled.`;
+    // Remove current item from front of queue
+    if (queue.length > 0 && queue[0].batchId === targetBatch.batchId) {
+      queue.shift();
+      await saveAlertQueue(db, queue);
+    }
 
-    await sock.sendMessage(remoteJid, { text: replyText });
+    if (queue.length > 0) {
+      const replyText = `👍 *Kept Active${progressLabel}:*
+*${targetBatch.itemName}* (Exp: ${expDateStr}) remains active in store tracking.`;
+      await sock.sendMessage(remoteJid, { text: replyText });
+
+      // Immediately send the NEXT item waiting in the queue!
+      const nextSent = await dispatchNextFromQueue(db, targetNumbers, true);
+      if (!nextSent) {
+        await sock.sendMessage(remoteJid, {
+          text: `🎉 *All pending expiry alerts${targetBatch.total ? ` (${targetBatch.total}/${targetBatch.total})` : ''} have been reviewed!*`
+        });
+      }
+    } else {
+      const replyText = `👍 *Kept Active${progressLabel}:*
+*${targetBatch.itemName}* (Exp: ${expDateStr}) remains active in store tracking.
+Next reminder will be sent as scheduled.
+
+🎉 *All pending expiry alerts${targetBatch.total ? ` (${targetBatch.total}/${targetBatch.total})` : ''} have been reviewed!*`;
+      await sock.sendMessage(remoteJid, { text: replyText });
+    }
   } else {
     // HELP PROMPT
-    const replyText = `❓ Regarding: *${targetBatch.itemName}* (Exp: ${expDateStr})
+    const replyText = `❓ Regarding${progressLabel}: *${targetBatch.itemName}* (Exp: ${expDateStr})
 Please reply:
 • *YES* — to keep tracking this batch in store
 • *NO* — to remove batch (stock finished)`;
@@ -502,6 +652,7 @@ Please reply:
 
 /**
  * Daily Automated Expiry Audit (Triggered via cron at 08:00 AM Asia/Colombo)
+ * Uses One-by-One Sequential Waiting Queue so alerts never overwrite each other
  */
 async function runDailyExpiryAudit(isManual = false) {
   console.log(`⏰ [Audit] Running expiry audit (Manual: ${isManual}, Time: ${new Date().toLocaleString('en-US', { timeZone: 'Asia/Colombo' })})...`);
@@ -523,11 +674,12 @@ async function runDailyExpiryAudit(isManual = false) {
   const snapshot = await db.collection('stock_batches').get();
   if (snapshot.empty) {
     console.log('ℹ️ [Audit] No batches found in stock_batches collection.');
+    await saveAlertQueue(db, []);
     return { count: 0, message: 'No batches' };
   }
 
-  let alertsDispatched = 0;
-
+  // 3. Collect all batches that hit an alert milestone
+  const candidates = [];
   for (const doc of snapshot.docs) {
     const batch = doc.data();
     const batchId = doc.id;
@@ -539,58 +691,41 @@ async function runDailyExpiryAudit(isManual = false) {
     const milestone = getAlertMilestone(days, batch.lastAlertSent, isManual);
 
     if (milestone) {
-      const expDateStr = formatDateString(batch.expiryDate);
-      const milestoneDesc = getMilestoneDescription(milestone, days);
-
-      const alertMessage = `⚠️ *EXPIRY ALERT (RATION STORE):*
-📦 *${batch.itemName}*
-⏳ Expiry Date: *${expDateStr}*
-⏱️ Status: ${milestoneDesc}
-
-Still in stock?
-Reply *YES* to keep tracking, or *NO* to remove from stock.
-
-_Ration Store Expiry Tracking System_`;
-
-      if (connectionStatus === 'CONNECTED' && sock) {
-        try {
-          // Send to ALL configured target phone numbers
-          for (const targetPhone of targetNumbers) {
-            const targetJid = `${targetPhone}@s.whatsapp.net`;
-            await sock.sendMessage(targetJid, { text: alertMessage });
-            console.log(`📤 [Alert Sent] To +${targetPhone} for ${batch.itemName} (Milestone: ${milestone})`);
-
-            // Save active context for reply handling (under both Phone and Privacy LID)
-            const alertCtx = {
-              batchId,
-              itemName: batch.itemName,
-              expiryDate: batch.expiryDate
-            };
-            activeBatchAlerts.set(targetPhone, alertCtx);
-            const knownLid = getLidForPhone(targetPhone);
-            if (knownLid) {
-              activeBatchAlerts.set(knownLid, alertCtx);
-            }
-          }
-
-          // Update Firestore batch document with last alerted milestone
-          await db.collection('stock_batches').doc(batchId).update({
-            lastAlertSent: milestone,
-            lastAlertDate: new Date().toISOString()
-          });
-
-          alertsDispatched++;
-        } catch (err) {
-          console.error(`❌ Failed to send WhatsApp alert for batch ${batchId}:`, err.message);
-        }
-      } else {
-        console.log(`⚠️ WhatsApp bot not connected. Alert queued for ${batch.itemName}`);
-      }
+      candidates.push({
+        batchId,
+        itemName: batch.itemName,
+        expiryDate: formatDateString(batch.expiryDate),
+        days,
+        milestone,
+        milestoneDesc: getMilestoneDescription(milestone, days)
+      });
     }
   }
 
-  console.log(`🏁 [Audit Finished] Total alerts dispatched: ${alertsDispatched} (to ${targetNumbers.length} recipients)`);
-  return { count: alertsDispatched, recipients: targetNumbers.length };
+  if (candidates.length === 0) {
+    console.log('🏁 [Audit Finished] No batches require alerts today.');
+    return { count: 0, totalQueued: 0, recipients: targetNumbers.length };
+  }
+
+  // 4. Sort by most urgent first (fewest days remaining first)
+  candidates.sort((a, b) => a.days - b.days);
+
+  const total = candidates.length;
+  const queueItems = candidates.map((item, idx) => ({
+    ...item,
+    index: idx + 1,
+    total
+  }));
+
+  // 5. Persist queue in Firestore and memory, then dispatch ONLY the 1st item (#1 of N)
+  await saveAlertQueue(db, queueItems);
+  console.log(`📋 [Audit Queue Created] ${total} item(s) queued in order of urgency. Dispatching item 1 of ${total}...`);
+
+  const firstDispatched = await dispatchNextFromQueue(db, targetNumbers, false);
+  const alertsDispatched = firstDispatched ? 1 : 0;
+
+  console.log(`🏁 [Audit Finished] Dispatched 1st alert (${firstDispatched?.itemName || 'none'}); ${Math.max(0, total - 1)} remaining in waiting queue.`);
+  return { count: alertsDispatched, totalQueued: total, recipients: targetNumbers.length };
 }
 
 // -------------------------------------------------------------
@@ -761,11 +896,12 @@ app.get('/qr', (req, res) => {
 app.get('/api/info', (req, res) => {
   res.json({
     app: 'Ration Store WhatsApp Automation Service',
-    version: '2.4.0',
+    version: '2.5.0',
     socketId: currentSocketId,
     connectionStatus,
     botPhoneNumber,
     hasQr: Boolean(latestQrDataUrl),
+    queueLength: pendingAlertQueue.length,
     timestamp: new Date().toISOString()
   });
 });
