@@ -796,6 +796,7 @@ app.get('/', (req, res) => {
           ${botPhoneNumber ? `<p style="color: #38bdf8; font-family: monospace; font-size: 1.15rem; margin-top: 15px;">Connected Bot Phone: <strong>+${botPhoneNumber}</strong></p>` : ''}
           <div style="margin-top: 25px;">
             <a class="btn btn-emerald" href="/qr">📱 Scan QR Code</a>
+            <a class="btn" href="/inspection" style="background:#0284c7;">📋 Inspection Dashboard</a>
             <button class="btn" onclick="fetch('/api/check-now', {method: 'POST'}).then(r=>r.json()).then(d=>alert('Audit Triggered: ' + JSON.stringify(d)))">⚡ Run Expiry Check Now</button>
             ${connectionStatus === 'CONNECTED' ? `<button class="btn btn-danger" onclick="if(confirm('Are you sure you want to change the sender bot account? This will unlink +${botPhoneNumber} and generate a new QR code.')){ fetch('/api/logout', {method: 'POST'}).then(() => window.location='/qr'); }">🔄 Change / Unlink Bot Number</button>` : ''}
           </div>
@@ -919,10 +920,282 @@ app.get('/qr', (req, res) => {
   `);
 });
 
+// -------------------------------------------------------------
+// Live Expiry Inspection Dashboard for CO / Director / Audits
+// Accessible via standard mobile phone camera QR scan
+// -------------------------------------------------------------
+app.get('/inspection', async (req, res) => {
+  try {
+    const db = getDb();
+    if (!db) {
+      return res.status(500).send('<h2>Database not connected. Please try again.</h2>');
+    }
+
+    const batchesSnap = await db.collection('stock_batches').get();
+    const masterSnap = await db.collection('master_items').get();
+
+    const masterMap = {};
+    masterSnap.forEach(doc => {
+      masterMap[doc.id] = doc.data();
+    });
+
+    const items = [];
+    batchesSnap.forEach(doc => {
+      const data = doc.data();
+      const days = getDaysRemaining(data.expiryDate);
+      const master = masterMap[data.itemId] || {};
+      const unit = master.unit || 'NOS';
+      const itemName = data.itemName || master.itemName || 'Unknown Item';
+      items.push({
+        batchId: doc.id,
+        itemId: data.itemId || '-',
+        itemName: itemName,
+        unit: unit,
+        expiryDate: data.expiryDate || '',
+        displayDate: formatDisplayDate(data.expiryDate),
+        days: days !== null ? days : 9999
+      });
+    });
+
+    // Sort ascending by remaining days (nearest expiry first)
+    items.sort((a, b) => a.days - b.days);
+
+    let countExpired = 0;
+    let countCritical = 0; // 0 - 3
+    let countUrgent = 0;   // 4 - 14
+    let countWarning = 0;  // 15 - 30
+    let countSafe = 0;     // > 30
+
+    items.forEach(it => {
+      if (it.days < 0) countExpired++;
+      else if (it.days <= 3) countCritical++;
+      else if (it.days <= 14) countUrgent++;
+      else if (it.days <= 30) countWarning++;
+      else countSafe++;
+    });
+
+    const nowFormatted = new Date().toLocaleString('en-GB', {
+      timeZone: 'Asia/Colombo',
+      dateStyle: 'medium',
+      timeStyle: 'short'
+    });
+
+    const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SLAF Ration Store - Live Expiry Inspection</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+    body { background-color: #0b1120; color: #f8fafc; padding: 16px; min-height: 100vh; }
+    .container { max-width: 900px; margin: 0 auto; }
+    
+    /* Header */
+    .header { background: #1e293b; border: 1px solid #334155; border-radius: 14px; padding: 20px; text-align: center; margin-bottom: 16px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
+    .header h3 { color: #38bdf8; font-size: 0.85rem; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 6px; font-weight: 800; }
+    .header h1 { font-size: 1.5rem; color: #ffffff; margin-bottom: 6px; font-weight: 900; }
+    .header .timestamp { color: #94a3b8; font-size: 0.82rem; }
+    .header .refresh-btn { display: inline-flex; align-items: center; gap: 6px; margin-top: 12px; padding: 7px 16px; background: #0284c7; color: white; border: none; border-radius: 8px; font-size: 0.85rem; font-weight: bold; cursor: pointer; text-decoration: none; }
+    .header .refresh-btn:hover { background: #0369a1; }
+
+    /* Summary Metrics Grid */
+    .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 16px; }
+    .metric-card { background: #1e293b; border-radius: 10px; padding: 12px; text-align: center; border: 1px solid #334155; cursor: pointer; transition: transform 0.15s ease, border-color 0.15s ease; }
+    .metric-card:hover { transform: translateY(-2px); }
+    .metric-card.active { border-color: #38bdf8; background: #243247; }
+    .metric-val { font-size: 1.6rem; font-weight: 900; margin-bottom: 2px; }
+    .metric-label { font-size: 0.75rem; text-transform: uppercase; font-weight: 700; color: #94a3b8; }
+    
+    .c-total { color: #38bdf8; }
+    .c-critical { color: #ef4444; }
+    .c-urgent { color: #f97316; }
+    .c-warning { color: #facc15; }
+    .c-safe { color: #10b981; }
+
+    /* Search & Filter Toolbar */
+    .toolbar { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+    .search-box { flex: 1; min-width: 240px; padding: 12px 16px; background: #1e293b; border: 1px solid #334155; border-radius: 10px; color: #ffffff; font-size: 0.95rem; outline: none; }
+    .search-box:focus { border-color: #38bdf8; }
+
+    /* Items List / Cards */
+    .items-container { display: flex; flex-direction: column; gap: 10px; }
+    .item-card { background: #1e293b; border-radius: 10px; padding: 14px 16px; border: 1px solid #334155; border-left: 6px solid #64748b; display: flex; flex-direction: column; gap: 8px; transition: background 0.15s ease; }
+    .item-card.critical { border-left-color: #ef4444; background: rgba(239, 68, 68, 0.08); }
+    .item-card.urgent { border-left-color: #f97316; background: rgba(249, 115, 22, 0.08); }
+    .item-card.warning { border-left-color: #facc15; background: rgba(250, 204, 21, 0.08); }
+    .item-card.safe { border-left-color: #10b981; }
+    
+    .card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+    .item-id-pill { background: #0f172a; color: #38bdf8; font-weight: 800; font-size: 0.75rem; padding: 3px 8px; border-radius: 6px; border: 1px solid #334155; display: inline-block; }
+    .item-unit { color: #94a3b8; font-size: 0.78rem; font-weight: 600; margin-left: 6px; }
+    .item-name { font-size: 1.05rem; font-weight: 800; color: #ffffff; margin-top: 4px; line-height: 1.3; }
+
+    .status-badge { font-size: 0.75rem; font-weight: 800; padding: 4px 10px; border-radius: 20px; white-space: nowrap; text-transform: uppercase; letter-spacing: 0.5px; }
+    .badge-critical { background: #ef4444; color: #ffffff; animation: pulse 2s infinite; }
+    .badge-urgent { background: #f97316; color: #ffffff; }
+    .badge-warning { background: #facc15; color: #000000; }
+    .badge-safe { background: #10b981; color: #ffffff; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
+
+    .card-bottom { display: flex; justify-content: space-between; align-items: center; border-top: 1px dashed #334155; padding-top: 8px; font-size: 0.85rem; color: #cbd5e1; flex-wrap: wrap; gap: 6px; }
+    .exp-date { font-weight: 700; color: #f8fafc; }
+    .days-left { font-weight: 800; }
+
+    .empty-state { text-align: center; padding: 40px 20px; background: #1e293b; border-radius: 12px; border: 1px solid #334155; color: #94a3b8; }
+    
+    @media (min-width: 600px) {
+      .header h1 { font-size: 1.8rem; }
+      .card-top { align-items: center; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h3>Sri Lanka Air Force • Catering Supply Depot</h3>
+      <h1>Live Expiry Inspection Dashboard</h1>
+      <div class="timestamp">📡 Real-Time Audit • Generated on ${nowFormatted}</div>
+      <a href="/inspection" class="refresh-btn">🔄 Refresh Stock Data</a>
+    </div>
+
+    <!-- Urgency Metrics Filters -->
+    <div class="metrics-grid">
+      <div class="metric-card active" onclick="setFilter('ALL', this)">
+        <div class="metric-val c-total">${items.length}</div>
+        <div class="metric-label">All Batches</div>
+      </div>
+      <div class="metric-card" onclick="setFilter('CRITICAL', this)">
+        <div class="metric-val c-critical">${countCritical + countExpired}</div>
+        <div class="metric-label">≤ 3 Days (Critical)</div>
+      </div>
+      <div class="metric-card" onclick="setFilter('URGENT', this)">
+        <div class="metric-val c-urgent">${countUrgent}</div>
+        <div class="metric-label">4 - 14 Days</div>
+      </div>
+      <div class="metric-card" onclick="setFilter('WARNING', this)">
+        <div class="metric-val c-warning">${countWarning}</div>
+        <div class="metric-label">15 - 30 Days</div>
+      </div>
+      <div class="metric-card" onclick="setFilter('SAFE', this)">
+        <div class="metric-val c-safe">${countSafe}</div>
+        <div class="metric-label">&gt; 30 Days</div>
+      </div>
+    </div>
+
+    <!-- Search input -->
+    <div class="toolbar">
+      <input type="text" id="searchBox" class="search-box" placeholder="🔍 Search item name, ID (e.g. RAT-001), or date..." oninput="filterList()">
+    </div>
+
+    <!-- Items List -->
+    <div class="items-container" id="itemsList">
+      ${items.length === 0 ? '<div class="empty-state"><h3>⚪ No active batches found in store</h3></div>' : ''}
+      ${items.map(it => {
+        let category = 'safe';
+        let badgeClass = 'badge-safe';
+        let badgeText = 'SAFE';
+        let daysText = it.days + ' days remaining';
+
+        if (it.days < 0) {
+          category = 'critical';
+          badgeClass = 'badge-critical';
+          badgeText = 'EXPIRED';
+          daysText = '⚠️ Expired (' + Math.abs(it.days) + 'd ago)';
+        } else if (it.days === 0) {
+          category = 'critical';
+          badgeClass = 'badge-critical';
+          badgeText = 'CRITICAL';
+          daysText = '🔴 EXPIRES TODAY';
+        } else if (it.days <= 3) {
+          category = 'critical';
+          badgeClass = 'badge-critical';
+          badgeText = 'CRITICAL';
+          daysText = '🔴 ' + String(it.days).padStart(2, '0') + ' days remaining';
+        } else if (it.days <= 14) {
+          category = 'urgent';
+          badgeClass = 'badge-urgent';
+          badgeText = 'URGENT';
+          daysText = '🟠 ' + String(it.days).padStart(2, '0') + ' days remaining';
+        } else if (it.days <= 30) {
+          category = 'warning';
+          badgeClass = 'badge-warning';
+          badgeText = 'WARNING';
+          daysText = '🟡 ' + it.days + ' days remaining';
+        } else {
+          category = 'safe';
+          badgeClass = 'badge-safe';
+          badgeText = 'SAFE';
+          daysText = '🟢 ' + it.days + ' days remaining';
+        }
+
+        return `
+          <div class="item-card ${category}" data-category="${category}" data-search="${(it.itemName + ' ' + it.itemId + ' ' + it.displayDate + ' ' + it.unit).toLowerCase()}">
+            <div class="card-top">
+              <div>
+                <span class="item-id-pill">${it.itemId}</span>
+                <span class="item-unit">D OF Q: ${it.unit}</span>
+                <div class="item-name">${it.itemName}</div>
+              </div>
+              <span class="status-badge ${badgeClass}">${badgeText}</span>
+            </div>
+            <div class="card-bottom">
+              <div>Expiry Date: <span class="exp-date">${it.displayDate}</span></div>
+              <div class="days-left">${daysText}</div>
+            </div>
+          </div>
+        `;
+      }).join('')}
+    </div>
+  </div>
+
+  <script>
+    let activeFilter = 'ALL';
+
+    function setFilter(filter, el) {
+      activeFilter = filter;
+      document.querySelectorAll('.metric-card').forEach(c => c.classList.remove('active'));
+      el.classList.add('active');
+      filterList();
+    }
+
+    function filterList() {
+      const q = document.getElementById('searchBox').value.trim().toLowerCase();
+      const cards = document.querySelectorAll('.item-card');
+      let visibleCount = 0;
+
+      cards.forEach(card => {
+        const cat = card.getAttribute('data-category');
+        const searchData = card.getAttribute('data-search');
+
+        let matchesCat = (activeFilter === 'ALL') || (activeFilter.toLowerCase() === cat);
+        let matchesQuery = !q || searchData.includes(q);
+
+        if (matchesCat && matchesQuery) {
+          card.style.display = 'flex';
+          visibleCount++;
+        } else {
+          card.style.display = 'none';
+        }
+      });
+    }
+  </script>
+</body>
+</html>
+    `;
+
+    res.send(html);
+  } catch (err) {
+    console.error('❌ Error rendering /inspection:', err.message);
+    res.status(500).send('<h2>Error loading inspection report: ' + err.message + '</h2>');
+  }
+});
+
 app.get('/api/info', (req, res) => {
   res.json({
     app: 'Ration Store WhatsApp Automation Service',
-    version: '2.6.0',
+    version: '2.7.0',
     socketId: currentSocketId,
     connectionStatus,
     botPhoneNumber,
