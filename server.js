@@ -5,11 +5,11 @@ const path = require('path');
 const fs = require('fs');
 const pino = require('pino');
 const QRCode = require('qrcode');
-const { 
-  default: makeWASocket, 
-  useMultiFileAuthState, 
-  DisconnectReason, 
-  fetchLatestBaileysVersion 
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion
 } = require('@whiskeysockets/baileys');
 
 const { getDb } = require('./firebase');
@@ -69,9 +69,9 @@ function destroyCurrentSocket() {
   if (sock) {
     const oldSock = sock;
     sock = null;
-    try { oldSock.ev.removeAllListeners(); } catch (e) {}
-    try { oldSock.ws?.close(); } catch (e) {}
-    try { oldSock.end(); } catch (e) {}
+    try { oldSock.ev.removeAllListeners(); } catch (e) { }
+    try { oldSock.ws?.close(); } catch (e) { }
+    try { oldSock.end(); } catch (e) { }
   }
 }
 
@@ -202,7 +202,7 @@ async function dispatchNextFromQueue(db, targetNumbers, isNext = false) {
       await db.collection('stock_batches').doc(item.batchId).update({
         lastAlertSent: item.milestone,
         lastAlertDate: new Date().toISOString()
-      }).catch(() => {});
+      }).catch(() => { });
 
       await saveAlertQueue(db, pendingAlertQueue);
       return item;
@@ -327,7 +327,7 @@ async function connectToWhatsApp(force = false) {
             botStatus: 'DISCONNECTED',
             botPhoneNumber: '',
             lastStatusUpdate: new Date().toISOString()
-          }, { merge: true }).catch(() => {});
+          }, { merge: true }).catch(() => { });
         }
       }
 
@@ -375,7 +375,7 @@ async function connectToWhatsApp(force = false) {
             }
           }
           if (firestore) {
-            firestore.collection('whatsapp_session').doc('backup').delete().catch(() => {});
+            firestore.collection('whatsapp_session').doc('backup').delete().catch(() => { });
           }
           // Immediately restart socket to generate new QR code for pairing
           scheduleReconnect(1500, true);
@@ -699,8 +699,25 @@ async function handleIncomingReply(text, remoteJid) {
   }
 
   // Check if sender is responding to a Procurement Workflow Prompt
-  if (pendingProcurementPromptByPhone.has(resolvedPhone) && (isYes || isNo)) {
-    const targetDemand = pendingProcurementPromptByPhone.get(resolvedPhone);
+  let targetDemand = pendingProcurementPromptByPhone.get(resolvedPhone);
+
+  // Fallback: If not in memory cache, check if sender is a procurement target and has active demands
+  if (!targetDemand && (isYes || isNo)) {
+    const isProcTarget = procTargetNumbers.some(t => resolvedPhone === t || resolvedPhone.endsWith(t) || t.endsWith(resolvedPhone));
+    if (isProcTarget) {
+      const snap = await db.collection('procurement_demands')
+        .where('isCompleted', '==', false)
+        .orderBy('lastUpdatedDate', 'desc')
+        .limit(1)
+        .get();
+      if (!snap.empty) {
+        const doc = snap.docs[0];
+        targetDemand = { id: doc.id, ...doc.data() };
+      }
+    }
+  }
+
+  if (targetDemand && (isYes || isNo)) {
     const now = new Date().toISOString();
     const currentStep = targetDemand.currentStep;
     const currentStepInfo = WORKFLOW_STEPS[currentStep - 1] || WORKFLOW_STEPS[0];
@@ -1312,44 +1329,44 @@ app.get('/inspection', async (req, res) => {
     <div class="items-container" id="itemsList">
       ${items.length === 0 ? '<div class="empty-state"><h3>⚪ No active batches found in store</h3></div>' : ''}
       ${items.map(it => {
-        let category = 'safe';
-        let badgeClass = 'badge-safe';
-        let badgeText = 'SAFE';
-        let daysText = it.days + ' days remaining';
+      let category = 'safe';
+      let badgeClass = 'badge-safe';
+      let badgeText = 'SAFE';
+      let daysText = it.days + ' days remaining';
 
-        if (it.days < 0) {
-          category = 'critical';
-          badgeClass = 'badge-critical';
-          badgeText = 'EXPIRED';
-          daysText = '⚠️ Expired (' + Math.abs(it.days) + 'd ago)';
-        } else if (it.days === 0) {
-          category = 'critical';
-          badgeClass = 'badge-critical';
-          badgeText = 'CRITICAL';
-          daysText = '🔴 EXPIRES TODAY';
-        } else if (it.days <= 3) {
-          category = 'critical';
-          badgeClass = 'badge-critical';
-          badgeText = 'CRITICAL';
-          daysText = '🔴 ' + String(it.days).padStart(2, '0') + ' days remaining';
-        } else if (it.days <= 14) {
-          category = 'urgent';
-          badgeClass = 'badge-urgent';
-          badgeText = 'URGENT';
-          daysText = '🟠 ' + String(it.days).padStart(2, '0') + ' days remaining';
-        } else if (it.days <= 30) {
-          category = 'warning';
-          badgeClass = 'badge-warning';
-          badgeText = 'WARNING';
-          daysText = '🟡 ' + it.days + ' days remaining';
-        } else {
-          category = 'safe';
-          badgeClass = 'badge-safe';
-          badgeText = 'SAFE';
-          daysText = '🟢 ' + it.days + ' days remaining';
-        }
+      if (it.days < 0) {
+        category = 'critical';
+        badgeClass = 'badge-critical';
+        badgeText = 'EXPIRED';
+        daysText = '⚠️ Expired (' + Math.abs(it.days) + 'd ago)';
+      } else if (it.days === 0) {
+        category = 'critical';
+        badgeClass = 'badge-critical';
+        badgeText = 'CRITICAL';
+        daysText = '🔴 EXPIRES TODAY';
+      } else if (it.days <= 3) {
+        category = 'critical';
+        badgeClass = 'badge-critical';
+        badgeText = 'CRITICAL';
+        daysText = '🔴 ' + String(it.days).padStart(2, '0') + ' days remaining';
+      } else if (it.days <= 14) {
+        category = 'urgent';
+        badgeClass = 'badge-urgent';
+        badgeText = 'URGENT';
+        daysText = '🟠 ' + String(it.days).padStart(2, '0') + ' days remaining';
+      } else if (it.days <= 30) {
+        category = 'warning';
+        badgeClass = 'badge-warning';
+        badgeText = 'WARNING';
+        daysText = '🟡 ' + it.days + ' days remaining';
+      } else {
+        category = 'safe';
+        badgeClass = 'badge-safe';
+        badgeText = 'SAFE';
+        daysText = '🟢 ' + it.days + ' days remaining';
+      }
 
-        return `
+      return `
           <div class="item-card ${category}" data-category="${category}" data-search="${(it.itemName + ' ' + it.itemId + ' ' + it.displayDate + ' ' + it.unit).toLowerCase()}">
             <div class="card-top">
               <div>
@@ -1365,7 +1382,7 @@ app.get('/inspection', async (req, res) => {
             </div>
           </div>
         `;
-      }).join('')}
+    }).join('')}
     </div>
   </div>
 
@@ -1441,7 +1458,7 @@ app.post('/api/logout', async (req, res) => {
     isConnecting = false;
     destroyCurrentSocket();
     if (oldSock) {
-      try { await oldSock.logout(); } catch (e) {}
+      try { await oldSock.logout(); } catch (e) { }
     }
 
     connectionStatus = 'DISCONNECTED';
@@ -1458,12 +1475,12 @@ app.post('/api/logout', async (req, res) => {
     // 2. Wipe Firestore session backup and set botStatus to DISCONNECTED
     const db = getDb();
     if (db) {
-      await db.collection('whatsapp_session').doc('backup').delete().catch(() => {});
+      await db.collection('whatsapp_session').doc('backup').delete().catch(() => { });
       await db.collection('settings').doc('config').set({
         botStatus: 'DISCONNECTED',
         botPhoneNumber: '',
         lastDisconnectedAt: new Date().toISOString()
-      }, { merge: true }).catch(() => {});
+      }, { merge: true }).catch(() => { });
       console.log('🗑️ [Session] Firestore session backup cleared and botStatus set to DISCONNECTED.');
     }
 
