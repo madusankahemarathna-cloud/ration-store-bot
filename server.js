@@ -401,6 +401,10 @@ async function connectToWhatsApp(force = false) {
             lastConnectedAt: new Date().toISOString()
           }, { merge: true }).then(() => {
             console.log(`📡 [Firestore] Synced botStatus: CONNECTED (+${botPhoneNumber})`);
+            // Check if any procurement workflow prompts are pending dispatch
+            setTimeout(() => {
+              dispatchProcurementPrompt(firestore);
+            }, 3000);
           }).catch((err) => {
             console.error('❌ [Firestore] Failed to sync CONNECTED status:', err.message);
           });
@@ -504,28 +508,18 @@ async function getProcurementTargetPhoneNumbers(db) {
   }
 }
 
-async function dispatchProcurementPrompt(db) {
-  if (!db || !sock || connectionStatus !== 'CONNECTED') return { count: 0, message: 'Bot offline' };
+async function sendProcurementPromptForDemand(db, demand) {
+  if (!db || !sock || connectionStatus !== 'CONNECTED') {
+    console.log(`⚠️ Cannot send prompt for ${demand?.demandNumber}: Bot not connected or offline.`);
+    return 0;
+  }
 
   const targets = await getProcurementTargetPhoneNumbers(db);
   if (targets.length === 0) {
-    console.log('⚠️ [Procurement] No procurement target numbers configured.');
-    return { count: 0, message: 'No target numbers' };
+    console.log('⚠️ [Procurement] No procurement recipient phone numbers configured in settings.');
+    return 0;
   }
 
-  const demandsSnap = await db.collection('procurement_demands')
-    .where('isCompleted', '==', false)
-    .orderBy('lastUpdatedDate', 'desc')
-    .limit(1)
-    .get();
-
-  if (demandsSnap.empty) {
-    console.log('ℹ️ [Procurement] No active pending demands.');
-    return { count: 0, message: 'No pending demands' };
-  }
-
-  const doc = demandsSnap.docs[0];
-  const demand = { id: doc.id, ...doc.data() };
   const step = WORKFLOW_STEPS[demand.currentStep - 1] || WORKFLOW_STEPS[0];
   const progressPercent = Math.round(((demand.currentStep - 1) / 22) * 100);
 
@@ -544,15 +538,58 @@ _Reply *YES* if done, or *NO* if still pending._`;
     const jid = `${phone}@s.whatsapp.net`;
     try {
       await sock.sendMessage(jid, { text: message });
-      console.log(`📤 [Procurement Prompt Sent] to +${phone} for ${demand.demandNumber} (Step ${demand.currentStep}/22)`);
+      console.log(`📤 [Instant WhatsApp Prompt Sent] to +${phone} for ${demand.demandNumber} (Step ${demand.currentStep}/22)`);
       pendingProcurementPromptByPhone.set(phone, demand);
       sent++;
     } catch (e) {
-      console.error(`❌ Failed to send procurement prompt to +${phone}:`, e.message);
+      console.error(`❌ Failed to send prompt to +${phone}:`, e.message);
     }
   }
+  return sent;
+}
 
+async function dispatchProcurementPrompt(db) {
+  if (!db || !sock || connectionStatus !== 'CONNECTED') return { count: 0, message: 'Bot offline' };
+
+  const demandsSnap = await db.collection('procurement_demands')
+    .where('isCompleted', '==', false)
+    .orderBy('lastUpdatedDate', 'desc')
+    .limit(1)
+    .get();
+
+  if (demandsSnap.empty) {
+    console.log('ℹ️ [Procurement] No active pending demands.');
+    return { count: 0, message: 'No pending demands' };
+  }
+
+  const doc = demandsSnap.docs[0];
+  const demand = { id: doc.id, ...doc.data() };
+  const sent = await sendProcurementPromptForDemand(db, demand);
   return { count: sent, demandNumber: demand.demandNumber, step: demand.currentStep };
+}
+
+function initProcurementRealtimeListener(db) {
+  if (!db) return;
+
+  let isFirst = true;
+  db.collection('procurement_demands')
+    .where('isCompleted', '==', false)
+    .onSnapshot(snapshot => {
+      if (isFirst) {
+        isFirst = false;
+        return; // Ignore initial historical documents on boot
+      }
+
+      snapshot.docChanges().forEach(change => {
+        if (change.type === 'added') {
+          const demand = { id: change.doc.id, ...change.doc.data() };
+          console.log(`🔔 [New Demand Created in App]: ${demand.demandNumber} - "${demand.topic}". Auto-dispatching WhatsApp notification...`);
+          sendProcurementPromptForDemand(db, demand);
+        }
+      });
+    }, err => {
+      console.error('❌ Real-time procurement listener error:', err.message);
+    });
 }
 
 /**
@@ -1529,7 +1566,8 @@ app.listen(PORT, () => {
   console.log(`⏰ Daily Expiry Check: 08:00 AM (Asia/Colombo)`);
   console.log(`=======================================================`);
 
-  // Initialize Firebase and WhatsApp
-  getDb();
+  // Initialize Firebase, WhatsApp and Realtime Listeners
+  const firestoreDb = getDb();
   connectToWhatsApp();
+  initProcurementRealtimeListener(firestoreDb);
 });
