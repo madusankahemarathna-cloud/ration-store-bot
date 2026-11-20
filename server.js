@@ -404,7 +404,9 @@ async function connectToWhatsApp(force = false) {
             console.log(`📡 [Firestore] Synced botStatus: CONNECTED (+${botPhoneNumber})`);
             // Check if any procurement workflow prompts are pending dispatch
             setTimeout(() => {
-              dispatchProcurementPrompt(firestore);
+              dispatchProcurementPrompt(firestore).catch(err => {
+                console.error('⚠️ [Procurement] Auto-dispatch prompt error:', err.message);
+              });
             }, 3000);
           }).catch((err) => {
             console.error('❌ [Firestore] Failed to sync CONNECTED status:', err.message);
@@ -550,23 +552,28 @@ _Reply *YES* if done, or *NO* if still pending._`;
 }
 
 async function dispatchProcurementPrompt(db) {
-  if (!db || !sock || connectionStatus !== 'CONNECTED') return { count: 0, message: 'Bot offline' };
+  try {
+    if (!db || !sock || connectionStatus !== 'CONNECTED') return { count: 0, message: 'Bot offline' };
 
-  const demandsSnap = await db.collection('procurement_demands')
-    .where('isCompleted', '==', false)
-    .orderBy('lastUpdatedDate', 'desc')
-    .limit(1)
-    .get();
+    const demandsSnap = await db.collection('procurement_demands')
+      .where('isCompleted', '==', false)
+      .get();
 
-  if (demandsSnap.empty) {
-    console.log('ℹ️ [Procurement] No active pending demands.');
-    return { count: 0, message: 'No pending demands' };
+    if (demandsSnap.empty) {
+      console.log('ℹ️ [Procurement] No active pending demands.');
+      return { count: 0, message: 'No pending demands' };
+    }
+
+    const demands = demandsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    demands.sort((a, b) => (b.lastUpdatedDate || '').localeCompare(a.lastUpdatedDate || ''));
+
+    const demand = demands[0];
+    const sent = await sendProcurementPromptForDemand(db, demand);
+    return { count: sent, demandNumber: demand.demandNumber, step: demand.currentStep };
+  } catch (err) {
+    console.error('❌ [Procurement] Error in dispatchProcurementPrompt:', err.message);
+    return { count: 0, message: err.message };
   }
-
-  const doc = demandsSnap.docs[0];
-  const demand = { id: doc.id, ...doc.data() };
-  const sent = await sendProcurementPromptForDemand(db, demand);
-  return { count: sent, demandNumber: demand.demandNumber, step: demand.currentStep };
 }
 
 function initProcurementRealtimeListener(db) {
@@ -745,12 +752,11 @@ async function handleIncomingReply(text, remoteJid) {
     if (isProcTarget) {
       const snap = await db.collection('procurement_demands')
         .where('isCompleted', '==', false)
-        .orderBy('lastUpdatedDate', 'desc')
-        .limit(1)
         .get();
       if (!snap.empty) {
-        const doc = snap.docs[0];
-        targetDemand = { id: doc.id, ...doc.data() };
+        const demands = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        demands.sort((a, b) => (b.lastUpdatedDate || '').localeCompare(a.lastUpdatedDate || ''));
+        targetDemand = demands[0];
       }
     }
   }
@@ -1470,7 +1476,7 @@ app.get('/inspection', async (req, res) => {
 app.get('/api/info', (req, res) => {
   res.json({
     app: 'Ration Store WhatsApp Automation Service',
-    version: '2.8.4',
+    version: '2.8.5',
     socketId: currentSocketId,
     connectionStatus,
     botPhoneNumber,
@@ -1596,12 +1602,13 @@ app.get('/procurement', async (req, res) => {
     }
 
     const targets = await getProcurementTargetPhoneNumbers(db);
-    const snap = await db.collection('procurement_demands').orderBy('lastUpdatedDate', 'desc').get();
+    const snap = await db.collection('procurement_demands').get();
 
     const demands = [];
     snap.forEach(doc => {
       demands.push({ id: doc.id, ...doc.data() });
     });
+    demands.sort((a, b) => (b.lastUpdatedDate || '').localeCompare(a.lastUpdatedDate || ''));
 
     const html = renderProcurementPage({
       connectionStatus,
