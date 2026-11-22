@@ -935,14 +935,31 @@ async function handleIncomingReply(text, remoteJid) {
 
           console.log(`✅ [Procurement Step Advanced] ${targetDemand.demandNumber} moved to Step ${nextStep}/22`);
 
+          // Update current item in queue with the new nextStep so next YES/NO continues on this file
+          if (procQueue.length > 0 && procQueue[0].demandId === targetDemand.id) {
+            procQueue[0].currentStep = nextStep;
+            await saveProcurementQueue(db, procQueue);
+          }
+
+          pendingProcurementPromptByPhone.set(resolvedPhone, {
+            ...targetDemand,
+            currentStep: nextStep
+          });
+
+          const remainingInQueue = procQueue.length > 0 ? procQueue.length - 1 : 0;
+          const queueFooter = remainingInQueue > 0 ? `\n\n⏳ _(${remainingInQueue} more file(s) waiting in queue)_` : '';
+
           await sock.sendMessage(remoteJid, {
-            text: `✅ *STEP ${currentStep}/22 COMPLETED!*${progressLabel}
+            text: `✅ *STEP ${String(currentStep).padStart(2, '0')}/22 COMPLETED!*${progressLabel}
 📁 *Demand:* *${targetDemand.demandNumber}*
 ✓ *Finished:* ${currentStepInfo.title}
 
-📍 *Moved to Step ${nextStep}/22 (${nextStepInfo.category}):*
-👉 *${nextStepInfo.text}*`
+📍 *Next Step ${String(nextStep).padStart(2, '0')}/22 (${nextStepInfo.category}):*
+👉 *${nextStepInfo.text}*
+
+_Reply *YES* if this step is also done, or *NO* if still pending._${queueFooter}`
           });
+          return;
         } else {
           await docRef.update({
             currentStep: 22,
@@ -961,35 +978,53 @@ async function handleIncomingReply(text, remoteJid) {
 
 _This demand is now marked as COMPLETED in the Dashboard._`
           });
+
+          // Since this file is 100% completed, shift it off the queue and advance to next file!
+          if (procQueue.length > 0 && procQueue[0].demandId === targetDemand.id) {
+            procQueue.shift();
+            await saveProcurementQueue(db, procQueue);
+
+            if (procQueue.length > 0) {
+              await dispatchNextProcurementFromQueue(db, true);
+            } else {
+              await sock.sendMessage(remoteJid, {
+                text: `🎉 *All active procurement files${targetDemand.total ? ` (${targetDemand.total}/${targetDemand.total})` : ''} have been reviewed!*
+_Type *DEMANDS* anytime to view active files overview._`
+              });
+            }
+          } else {
+            pendingProcurementPromptByPhone.delete(resolvedPhone);
+          }
+          return;
         }
       } else if (isNo) {
         console.log(`⏳ [Procurement Pending] ${targetDemand.demandNumber} remains at Step ${currentStep}/22`);
         await sock.sendMessage(remoteJid, {
           text: `⏳ *RECORDED (STILL PENDING)*${progressLabel}
 📁 *Demand:* *${targetDemand.demandNumber}*
-File remains at *Step ${currentStep}/22*:
+File remains at *Step ${String(currentStep).padStart(2, '0')}/22*:
 👉 *${currentStepInfo.text}*`
         });
-      }
 
-      // Handle Procurement Queue progression
-      if (procQueue.length > 0 && procQueue[0].demandId === targetDemand.id) {
-        procQueue.shift();
-        await saveProcurementQueue(db, procQueue);
+        // Since officer answered NO for this file, this file's review is finished for now!
+        // Shift this file off the queue and immediately advance to the NEXT file in queue!
+        if (procQueue.length > 0 && procQueue[0].demandId === targetDemand.id) {
+          procQueue.shift();
+          await saveProcurementQueue(db, procQueue);
 
-        if (procQueue.length > 0) {
-          // Immediately dispatch the NEXT procurement file waiting in queue!
-          await dispatchNextProcurementFromQueue(db, true);
-        } else {
-          await sock.sendMessage(remoteJid, {
-            text: `🎉 *All active procurement files${targetDemand.total ? ` (${targetDemand.total}/${targetDemand.total})` : ''} have been reviewed!*
+          if (procQueue.length > 0) {
+            await dispatchNextProcurementFromQueue(db, true);
+          } else {
+            await sock.sendMessage(remoteJid, {
+              text: `🎉 *All active procurement files${targetDemand.total ? ` (${targetDemand.total}/${targetDemand.total})` : ''} have been reviewed!*
 _Type *DEMANDS* anytime to view active files overview._`
-          });
+            });
+          }
+        } else {
+          pendingProcurementPromptByPhone.delete(resolvedPhone);
         }
-      } else {
-        pendingProcurementPromptByPhone.delete(resolvedPhone);
+        return;
       }
-      return;
     }
   }
 
