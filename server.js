@@ -843,8 +843,6 @@ async function handleIncomingReply(text, remoteJid) {
   }
 
   const normalized = text.trim().toUpperCase();
-  const isNo = /^(NO|N|REMOVE|FINISH|FINISHED|OUT\s+OF\s+STOCK|CLEAR|NAHA|PNAHA)$/i.test(normalized) || normalized.startsWith('NO');
-  const isYes = /^(YES|Y|KEEP|STILL\s+IN\s+STOCK|AVAILABLE|OW|DONE|COMPLETED|HARI)$/i.test(normalized) || normalized.startsWith('YES');
 
   // Check if this is a Procurement Status Inquiry or Next Prompt trigger
   if (normalized === 'DEMANDS' || normalized === 'FILES' || normalized === 'PROCUREMENT') {
@@ -866,6 +864,20 @@ async function handleIncomingReply(text, remoteJid) {
 
   if (normalized === 'PROMPT' || normalized === 'CHECK PROC') {
     await dispatchProcurementPrompt(db);
+    return;
+  }
+
+  // Strict matching for YES and NO:
+  // Clean alphanumeric string only (removes spaces, punctuation, emojis)
+  const cleanInput = normalized.replace(/[^A-Z]/g, '');
+  const isNo = /^(NO|N|NAHA|PNAHA|REMOVE|FINISH|FINISHED|OUTOFSTOCK|CLEAR)$/i.test(cleanInput);
+  const isYes = /^(YES|Y|OW|HARI|DONE|COMPLETED|KEEP|STILLINSTOCK|AVAILABLE)$/i.test(cleanInput);
+
+  // STRICT REQUIREMENT:
+  // If the reply is neither YES nor NO, SILENTLY IGNORE IT!
+  // No WhatsApp response, no notification sent, and no process state changed.
+  if (!isYes && !isNo) {
+    console.log(`ℹ️ [Silently Ignored] Received non-actionable message: "${text}" from +${resolvedPhone}. Neither YES nor NO. No reply sent, no state changed.`);
     return;
   }
 
@@ -1133,13 +1145,8 @@ Next reminder will be sent as scheduled.
       await sock.sendMessage(remoteJid, { text: replyText });
     }
   } else {
-    // HELP PROMPT
-    const replyText = `❓ Regarding${progressLabel}: *${targetBatch.itemName}* (Exp: ${expDateStr})
-Please reply:
-• *YES* — to keep tracking this batch in store
-• *NO* — to remove batch (stock finished)`;
-
-    await sock.sendMessage(remoteJid, { text: replyText });
+    // Silently ignore non-YES/NO
+    return;
   }
 }
 
