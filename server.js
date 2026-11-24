@@ -522,19 +522,12 @@ async function getProcurementTargetPhoneNumbers(db) {
       });
     }
 
-    // Fallback to general target WhatsApp numbers if procurement numbers not set
-    if (numbers.length === 0 && Array.isArray(data.targetWhatsAppNumbers)) {
-      data.targetWhatsAppNumbers.forEach(p => {
-        const cleaned = cleanPhoneNumber(p);
-        if (cleaned && !numbers.includes(cleaned)) numbers.push(cleaned);
-      });
-    }
-
-    if (numbers.length === 0 && data.targetWhatsAppNumber) {
-      const cleaned = cleanPhoneNumber(data.targetWhatsAppNumber);
+    if (numbers.length === 0 && data.procurementTargetWhatsAppNumber) {
+      const cleaned = cleanPhoneNumber(data.procurementTargetWhatsAppNumber);
       if (cleaned && !numbers.includes(cleaned)) numbers.push(cleaned);
     }
 
+    // STRICT ISOLATION: Zero fallback to Ration Store target numbers!
     return numbers;
   } catch (err) {
     console.error('❌ Error fetching procurement target phone numbers:', err.message);
@@ -810,6 +803,16 @@ function getLidForPhone(phone) {
   return null;
 }
 
+function isPhoneInTargetList(phone, rawId, targetList) {
+  if (!Array.isArray(targetList) || targetList.length === 0) return false;
+  return targetList.some(target => {
+    if (phone && (phone === target || phone.endsWith(target) || target.endsWith(phone))) return true;
+    const knownLid = getLidForPhone(target);
+    if (knownLid && rawId && (rawId === knownLid || rawId.endsWith(knownLid))) return true;
+    return false;
+  });
+}
+
 /**
  * Handle Two-Way Replies ("YES" or "NO") with One-by-One Waiting Queue
  */
@@ -820,32 +823,31 @@ async function handleIncomingReply(text, remoteJid) {
     return;
   }
 
-  // 1. Fetch Target WhatsApp Numbers from Firestore settings
+  // 1. Fetch distinct Target WhatsApp Numbers for each project (Strictly Isolated)
   const targetNumbers = await getTargetPhoneNumbers(db);
   const procTargetNumbers = await getProcurementTargetPhoneNumbers(db);
-  const allTargetNumbers = [...new Set([...targetNumbers, ...procTargetNumbers])];
   const resolvedPhone = resolvePhoneFromJid(remoteJid);
   const rawId = remoteJid.split('@')[0].split(':')[0];
 
   console.log(`📩 [WhatsApp Received] From: ${remoteJid} (Phone: +${resolvedPhone}) | Message: "${text}"`);
 
-  // Validate sender authorization
-  const isAuthorized = allTargetNumbers.length === 0 || allTargetNumbers.some(target => {
-    if (resolvedPhone === target || resolvedPhone.endsWith(target) || target.endsWith(resolvedPhone)) return true;
-    const knownLid = getLidForPhone(target);
-    if (knownLid && (rawId === knownLid || rawId.endsWith(knownLid))) return true;
-    return false;
-  });
+  // Identify sender project authorization with strict boundary checking
+  const isProcSender = isPhoneInTargetList(resolvedPhone, rawId, procTargetNumbers);
+  const isRationSender = isPhoneInTargetList(resolvedPhone, rawId, targetNumbers);
 
-  if (!isAuthorized) {
-    console.log(`ℹ️ [Ignored] Message received from non-target identifier: ${rawId} (Resolved: ${resolvedPhone})`);
+  if (!isProcSender && !isRationSender) {
+    console.log(`ℹ️ [Ignored Unauthorized] Message received from unregistered phone: +${resolvedPhone} (raw: ${rawId})`);
     return;
   }
 
   const normalized = text.trim().toUpperCase();
 
-  // Check if this is a Procurement Status Inquiry or Next Prompt trigger
+  // Procurement Status Inquiry command (ONLY for Procurement officers)
   if (normalized === 'DEMANDS' || normalized === 'FILES' || normalized === 'PROCUREMENT') {
+    if (!isProcSender) {
+      console.log(`ℹ️ [Ignored] DEMANDS command sent by non-procurement number: +${resolvedPhone}`);
+      return;
+    }
     const snap = await db.collection('procurement_demands').where('isCompleted', '==', false).get();
     if (snap.empty) {
       await sock.sendMessage(remoteJid, { text: `📂 *PROCUREMENT WORKFLOW STATUS*\n\n✅ No active demands pending! All files completed.` });
@@ -862,7 +864,12 @@ async function handleIncomingReply(text, remoteJid) {
     return;
   }
 
+  // Procurement Prompt Trigger (ONLY for Procurement officers)
   if (normalized === 'PROMPT' || normalized === 'CHECK PROC') {
+    if (!isProcSender) {
+      console.log(`ℹ️ [Ignored] PROMPT command sent by non-procurement number: +${resolvedPhone}`);
+      return;
+    }
     await dispatchProcurementPrompt(db);
     return;
   }
@@ -881,30 +888,35 @@ async function handleIncomingReply(text, remoteJid) {
     return;
   }
 
-  // Determine if this reply is for Procurement or Ration Store
-  const procQueue = await loadProcurementQueue(db);
-  const rationQueue = await loadAlertQueue(db);
-
+  // STRICT PROJECT ROUTING:
+  // Determine whether this message is destined for Procurement or Ration Store
   let isProcurement = false;
-  if (pendingProcurementPromptByPhone.has(resolvedPhone)) {
+
+  if (isProcSender && !isRationSender) {
+    // 100% EXCLUSIVE Procurement Officer!
     isProcurement = true;
-  } else if (activeBatchAlerts.has(resolvedPhone) || activeBatchAlerts.has(rawId)) {
+  } else if (isRationSender && !isProcSender) {
+    // 100% EXCLUSIVE Ration Store Officer!
     isProcurement = false;
-  } else if (procQueue.length > 0 && rationQueue.length === 0) {
-    isProcurement = true;
-  } else if (rationQueue.length > 0 && procQueue.length === 0) {
-    isProcurement = false;
-  } else if (procQueue.length > 0 && rationQueue.length > 0) {
-    const isProcTarget = procTargetNumbers.some(t => resolvedPhone === t || resolvedPhone.endsWith(t) || t.endsWith(resolvedPhone));
-    const isRationTarget = targetNumbers.some(t => resolvedPhone === t || resolvedPhone.endsWith(t) || t.endsWith(resolvedPhone));
-    if (isProcTarget && !isRationTarget) isProcurement = true;
-    else isProcurement = false;
+  } else {
+    // Shared number (registered in both projects) -> disambiguate using active alert state
+    if (pendingProcurementPromptByPhone.has(resolvedPhone)) {
+      isProcurement = true;
+    } else if (activeBatchAlerts.has(resolvedPhone) || activeBatchAlerts.has(rawId)) {
+      isProcurement = false;
+    } else {
+      const procQueue = await loadProcurementQueue(db);
+      const rationQueue = await loadAlertQueue(db);
+      if (procQueue.length > 0 && rationQueue.length === 0) isProcurement = true;
+      else isProcurement = false;
+    }
   }
 
-  if (isProcurement && (isYes || isNo)) {
+  if (isProcurement) {
+    const procQueue = await loadProcurementQueue(db);
     let targetDemand = procQueue.length > 0 ? { ...procQueue[0], id: procQueue[0].demandId } : pendingProcurementPromptByPhone.get(resolvedPhone);
 
-    // Fallback: If not in memory cache, check if sender is a procurement target and has active demands
+    // Fallback: If not in memory cache, check if sender has active demands
     if (!targetDemand) {
       const snap = await db.collection('procurement_demands')
         .where('isCompleted', '==', false)
@@ -916,53 +928,57 @@ async function handleIncomingReply(text, remoteJid) {
       }
     }
 
-    if (targetDemand) {
-      const now = new Date().toISOString();
-      const currentStep = targetDemand.currentStep;
-      const currentStepInfo = WORKFLOW_STEPS[currentStep - 1] || WORKFLOW_STEPS[0];
-      const progressLabel = targetDemand.total && targetDemand.total > 1 ? ` (${targetDemand.index}/${targetDemand.total})` : '';
+    if (!targetDemand) {
+      console.log(`ℹ️ [Procurement] No active pending demands found for +${resolvedPhone}. Silently ignoring.`);
+      return; // STRICT: NEVER fall through to Ration Store!
+    }
 
-      if (isYes) {
-        const docRef = db.collection('procurement_demands').doc(targetDemand.id);
-        const docSnap = await docRef.get();
-        const history = docSnap.get('history') || [];
+    const now = new Date().toISOString();
+    const currentStep = targetDemand.currentStep;
+    const currentStepInfo = WORKFLOW_STEPS[currentStep - 1] || WORKFLOW_STEPS[0];
+    const progressLabel = targetDemand.total && targetDemand.total > 1 ? ` (${targetDemand.index}/${targetDemand.total})` : '';
 
-        history.push({
-          stepIndex: currentStep,
-          stepName: currentStepInfo.text,
-          completedAt: new Date().toLocaleString('en-GB', { timeZone: 'Asia/Colombo' }),
-          completedBy: `+${resolvedPhone}`
+    if (isYes) {
+      const docRef = db.collection('procurement_demands').doc(targetDemand.id);
+      const docSnap = await docRef.get();
+      const history = docSnap.get('history') || [];
+
+      history.push({
+        stepIndex: currentStep,
+        stepName: currentStepInfo.text,
+        completedAt: new Date().toLocaleString('en-GB', { timeZone: 'Asia/Colombo' }),
+        completedBy: `+${resolvedPhone}`
+      });
+
+      if (currentStep < 22) {
+        const nextStep = currentStep + 1;
+        const nextStepInfo = WORKFLOW_STEPS[nextStep - 1];
+
+        await docRef.update({
+          currentStep: nextStep,
+          isCompleted: false,
+          lastUpdatedDate: now,
+          history: history
         });
 
-        if (currentStep < 22) {
-          const nextStep = currentStep + 1;
-          const nextStepInfo = WORKFLOW_STEPS[nextStep - 1];
+        console.log(`✅ [Procurement Step Advanced] ${targetDemand.demandNumber} moved to Step ${nextStep}/22`);
 
-          await docRef.update({
-            currentStep: nextStep,
-            isCompleted: false,
-            lastUpdatedDate: now,
-            history: history
-          });
+        // Update current item in queue with the new nextStep so next YES/NO continues on this file
+        if (procQueue.length > 0 && procQueue[0].demandId === targetDemand.id) {
+          procQueue[0].currentStep = nextStep;
+          await saveProcurementQueue(db, procQueue);
+        }
 
-          console.log(`✅ [Procurement Step Advanced] ${targetDemand.demandNumber} moved to Step ${nextStep}/22`);
+        pendingProcurementPromptByPhone.set(resolvedPhone, {
+          ...targetDemand,
+          currentStep: nextStep
+        });
 
-          // Update current item in queue with the new nextStep so next YES/NO continues on this file
-          if (procQueue.length > 0 && procQueue[0].demandId === targetDemand.id) {
-            procQueue[0].currentStep = nextStep;
-            await saveProcurementQueue(db, procQueue);
-          }
+        const remainingInQueue = procQueue.length > 0 ? procQueue.length - 1 : 0;
+        const queueFooter = remainingInQueue > 0 ? `\n\n⏳ _(${remainingInQueue} more file(s) waiting in queue)_` : '';
 
-          pendingProcurementPromptByPhone.set(resolvedPhone, {
-            ...targetDemand,
-            currentStep: nextStep
-          });
-
-          const remainingInQueue = procQueue.length > 0 ? procQueue.length - 1 : 0;
-          const queueFooter = remainingInQueue > 0 ? `\n\n⏳ _(${remainingInQueue} more file(s) waiting in queue)_` : '';
-
-          await sock.sendMessage(remoteJid, {
-            text: `✅ *STEP ${String(currentStep).padStart(2, '0')}/22 COMPLETED!*${progressLabel}
+        await sock.sendMessage(remoteJid, {
+          text: `✅ *STEP ${String(currentStep).padStart(2, '0')}/22 COMPLETED!*${progressLabel}
 📁 *Demand:* *${targetDemand.demandNumber}*
 ✓ *Finished:* ${currentStepInfo.title}
 
@@ -970,56 +986,28 @@ async function handleIncomingReply(text, remoteJid) {
 👉 *${nextStepInfo.text}*
 
 _Reply *YES* if this step is also done, or *NO* if still pending._${queueFooter}`
-          });
-          return;
-        } else {
-          await docRef.update({
-            currentStep: 22,
-            isCompleted: true,
-            lastUpdatedDate: now,
-            history: history
-          });
+        });
+        return;
+      } else {
+        await docRef.update({
+          currentStep: 22,
+          isCompleted: true,
+          lastUpdatedDate: now,
+          history: history
+        });
 
-          console.log(`🎉 [Procurement Completed] ${targetDemand.demandNumber} finished all 22 steps!`);
+        console.log(`🎉 [Procurement Completed] ${targetDemand.demandNumber} finished all 22 steps!`);
 
-          await sock.sendMessage(remoteJid, {
-            text: `🎉 *CONGRATULATIONS! ALL 22 STEPS FINISHED!*${progressLabel}
+        await sock.sendMessage(remoteJid, {
+          text: `🎉 *CONGRATULATIONS! ALL 22 STEPS FINISHED!*${progressLabel}
 📁 *Demand No:* *${targetDemand.demandNumber}*
 📝 *Topic:* ${targetDemand.topic}
 ✅ *Final Step 22 Completed:* Bill forwarded to HQ for payment.
 
 _This demand is now marked as COMPLETED in the Dashboard._`
-          });
-
-          // Since this file is 100% completed, shift it off the queue and advance to next file!
-          if (procQueue.length > 0 && procQueue[0].demandId === targetDemand.id) {
-            procQueue.shift();
-            await saveProcurementQueue(db, procQueue);
-
-            if (procQueue.length > 0) {
-              await dispatchNextProcurementFromQueue(db, true);
-            } else {
-              await sock.sendMessage(remoteJid, {
-                text: `🎉 *All active procurement files${targetDemand.total ? ` (${targetDemand.total}/${targetDemand.total})` : ''} have been reviewed!*
-_Type *DEMANDS* anytime to view active files overview._`
-              });
-            }
-          } else {
-            pendingProcurementPromptByPhone.delete(resolvedPhone);
-          }
-          return;
-        }
-      } else if (isNo) {
-        console.log(`⏳ [Procurement Pending] ${targetDemand.demandNumber} remains at Step ${currentStep}/22`);
-        await sock.sendMessage(remoteJid, {
-          text: `⏳ *RECORDED (STILL PENDING)*${progressLabel}
-📁 *Demand:* *${targetDemand.demandNumber}*
-File remains at *Step ${String(currentStep).padStart(2, '0')}/22*:
-👉 *${currentStepInfo.text}*`
         });
 
-        // Since officer answered NO for this file, this file's review is finished for now!
-        // Shift this file off the queue and immediately advance to the NEXT file in queue!
+        // Since this file is 100% completed, shift it off the queue and advance to next file!
         if (procQueue.length > 0 && procQueue[0].demandId === targetDemand.id) {
           procQueue.shift();
           await saveProcurementQueue(db, procQueue);
@@ -1037,7 +1025,43 @@ _Type *DEMANDS* anytime to view active files overview._`
         }
         return;
       }
+    } else if (isNo) {
+      console.log(`⏳ [Procurement Pending] ${targetDemand.demandNumber} remains at Step ${currentStep}/22`);
+      await sock.sendMessage(remoteJid, {
+        text: `⏳ *RECORDED (STILL PENDING)*${progressLabel}
+📁 *Demand:* *${targetDemand.demandNumber}*
+File remains at *Step ${String(currentStep).padStart(2, '0')}/22*:
+👉 *${currentStepInfo.text}*`
+      });
+
+      // Since officer answered NO for this file, this file's review is finished for now!
+      // Shift this file off the queue and immediately advance to the NEXT file in queue!
+      if (procQueue.length > 0 && procQueue[0].demandId === targetDemand.id) {
+        procQueue.shift();
+        await saveProcurementQueue(db, procQueue);
+
+        if (procQueue.length > 0) {
+          await dispatchNextProcurementFromQueue(db, true);
+        } else {
+          await sock.sendMessage(remoteJid, {
+            text: `🎉 *All active procurement files${targetDemand.total ? ` (${targetDemand.total}/${targetDemand.total})` : ''} have been reviewed!*
+_Type *DEMANDS* anytime to view active files overview._`
+          });
+        }
+      } else {
+        pendingProcurementPromptByPhone.delete(resolvedPhone);
+      }
+      return;
     }
+    return;
+  }
+
+  // -------------------------------------------------------------
+  // RATION STORE STOCK EXPIRY WORKFLOW (STRICTLY for Ration Store Officers)
+  // -------------------------------------------------------------
+  if (!isRationSender) {
+    console.log(`ℹ️ [Ignored] Non-ration sender +${resolvedPhone} attempted to trigger Ration Store workflow.`);
+    return;
   }
 
   // 2. Load One-by-One Waiting Queue first (persisted in Firestore)
