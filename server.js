@@ -548,18 +548,19 @@ async function sendProcurementPromptForDemand(db, demand, countLabel = '', queue
   }
 
   const step = WORKFLOW_STEPS[demand.currentStep - 1] || WORKFLOW_STEPS[0];
-  const progressPercent = Math.round(((demand.currentStep - 1) / 22) * 100);
+  const replyHint = demand.currentStep === 12
+    ? '_Reply *YES* if Approved, *NO* if Pending, or *CANCEL* if Rejected._'
+    : '_Reply *YES* if done, or *NO* if still pending._';
 
-  const message = `📋 *SLAF PROCUREMENT WORKFLOW TRACKER*${countLabel}
-📁 *Demand No:* *${demand.demandNumber}*
-📝 *Topic:* ${demand.topic}
-🏢 *Section:* ${demand.section || 'General'}
-📊 *Progress:* ${demand.currentStep - 1}/22 Completed (${progressPercent}%)
+  const message = `*File No – ${demand.demandNumber}*
 
-📍 *Current Step ${String(demand.currentStep).padStart(2, '0')}/22 (${step.category}):*
-👉 *${step.text}*
+${demand.topic}
 
-_Reply *YES* if done, or *NO* if still pending._${queueFooter}`;
+✓ *Status* - Pending at ${step.title}.
+
+✓ *${step.text}*
+
+${replyHint}`;
 
   let sent = 0;
   for (const phone of targets) {
@@ -606,22 +607,19 @@ async function dispatchNextProcurementFromQueue(db, isNext = false) {
     }
 
     const step = WORKFLOW_STEPS[item.currentStep - 1] || WORKFLOW_STEPS[0];
-    const progressPercent = Math.round(((item.currentStep - 1) / 22) * 100);
-    const countLabel = item.total && item.total > 1 ? ` (${item.index}/${item.total})` : '';
-    const queueFooter = remainingAfterThis > 0
-      ? `\n\n⏳ _(${remainingAfterThis} more file(s) waiting in queue)_`
-      : '';
+    const replyHint = item.currentStep === 12
+      ? '_Reply *YES* if Approved, *NO* if Pending, or *CANCEL* if Rejected._'
+      : '_Reply *YES* if done, or *NO* if still pending._';
 
-    const message = `📋 *SLAF PROCUREMENT WORKFLOW TRACKER*${countLabel}
-📁 *Demand No:* *${item.demandNumber}*
-📝 *Topic:* ${item.topic}
-🏢 *Section:* ${item.section}
-📊 *Progress:* ${item.currentStep - 1}/22 Completed (${progressPercent}%)
+    const message = `*File No – ${item.demandNumber}*
 
-📍 *Current Step ${String(item.currentStep).padStart(2, '0')}/22 (${step.category}):*
-👉 *${step.text}*
+${item.topic}
 
-_Reply *YES* if done, or *NO* if still pending._${queueFooter}`;
+✓ *Status* - Pending at ${step.title}.
+
+✓ *${step.text}*
+
+${replyHint}`;
 
     if (connectionStatus === 'CONNECTED' && sock) {
       for (const phone of targets) {
@@ -879,12 +877,13 @@ async function handleIncomingReply(text, remoteJid) {
   const cleanInput = normalized.replace(/[^A-Z]/g, '');
   const isNo = /^(NO|N|NAHA|PNAHA|REMOVE|FINISH|FINISHED|OUTOFSTOCK|CLEAR)$/i.test(cleanInput);
   const isYes = /^(YES|Y|OW|HARI|DONE|COMPLETED|KEEP|STILLINSTOCK|AVAILABLE)$/i.test(cleanInput);
+  const isCancel = /^(CANCEL|CANCELLED|CANCELED|REJECT|REJECTED|DROP)$/i.test(cleanInput);
 
   // STRICT REQUIREMENT:
-  // If the reply is neither YES nor NO, SILENTLY IGNORE IT!
+  // If the reply is neither YES, NO, nor CANCEL, SILENTLY IGNORE IT!
   // No WhatsApp response, no notification sent, and no process state changed.
-  if (!isYes && !isNo) {
-    console.log(`ℹ️ [Silently Ignored] Received non-actionable message: "${text}" from +${resolvedPhone}. Neither YES nor NO. No reply sent, no state changed.`);
+  if (!isYes && !isNo && !isCancel) {
+    console.log(`ℹ️ [Silently Ignored] Received non-actionable message: "${text}" from +${resolvedPhone}. Neither YES, NO, nor CANCEL. No reply sent, no state changed.`);
     return;
   }
 
@@ -977,15 +976,22 @@ async function handleIncomingReply(text, remoteJid) {
         const remainingInQueue = procQueue.length > 0 ? procQueue.length - 1 : 0;
         const queueFooter = remainingInQueue > 0 ? `\n\n⏳ _(${remainingInQueue} more file(s) waiting in queue)_` : '';
 
+        const nextReplyHint = nextStep === 12
+          ? '_Reply *YES* if Approved, *NO* if Pending, or *CANCEL* if Rejected._'
+          : '_Reply *YES* if done, or *NO* if still pending._';
+
         await sock.sendMessage(remoteJid, {
-          text: `✅ *STEP ${String(currentStep).padStart(2, '0')}/22 COMPLETED!*${progressLabel}
-📁 *Demand:* *${targetDemand.demandNumber}*
-✓ *Finished:* ${currentStepInfo.title}
+          text: `✅ *Step Completed: ${currentStepInfo.title}*
 
-📍 *Next Step ${String(nextStep).padStart(2, '0')}/22 (${nextStepInfo.category}):*
-👉 *${nextStepInfo.text}*
+*File No – ${targetDemand.demandNumber}*
 
-_Reply *YES* if this step is also done, or *NO* if still pending._${queueFooter}`
+${targetDemand.topic}
+
+✓ *Status* - Pending at ${nextStepInfo.title}.
+
+✓ *${nextStepInfo.text}*
+
+${nextReplyHint}`
         });
         return;
       } else {
@@ -1028,14 +1034,68 @@ _Type *DEMANDS* anytime to view active files overview._`
     } else if (isNo) {
       console.log(`⏳ [Procurement Pending] ${targetDemand.demandNumber} remains at Step ${currentStep}/22`);
       await sock.sendMessage(remoteJid, {
-        text: `⏳ *RECORDED (STILL PENDING)*${progressLabel}
-📁 *Demand:* *${targetDemand.demandNumber}*
-File remains at *Step ${String(currentStep).padStart(2, '0')}/22*:
-👉 *${currentStepInfo.text}*`
+        text: `⏳ *File remains pending*
+
+*File No – ${targetDemand.demandNumber}*
+
+${targetDemand.topic}
+
+✓ *Status* - Pending at ${currentStepInfo.title}.`
       });
 
       // Since officer answered NO for this file, this file's review is finished for now!
       // Shift this file off the queue and immediately advance to the NEXT file in queue!
+      if (procQueue.length > 0 && procQueue[0].demandId === targetDemand.id) {
+        procQueue.shift();
+        await saveProcurementQueue(db, procQueue);
+
+        if (procQueue.length > 0) {
+          await dispatchNextProcurementFromQueue(db, true);
+        } else {
+          await sock.sendMessage(remoteJid, {
+            text: `🎉 *All active procurement files${targetDemand.total ? ` (${targetDemand.total}/${targetDemand.total})` : ''} have been reviewed!*
+_Type *DEMANDS* anytime to view active files overview._`
+          });
+        }
+      } else {
+        pendingProcurementPromptByPhone.delete(resolvedPhone);
+      }
+      return;
+    } else if (isCancel) {
+      console.log(`❌ [Procurement Cancelled] ${targetDemand.demandNumber} cancelled at Step ${currentStep}/22`);
+      const docRef = db.collection('procurement_demands').doc(targetDemand.id);
+      const docSnap = await docRef.get();
+      const history = docSnap.get('history') || [];
+
+      history.push({
+        stepIndex: currentStep,
+        stepName: `${currentStepInfo.title} (Cancelled/Rejected)`,
+        completedAt: new Date().toLocaleString('en-GB', { timeZone: 'Asia/Colombo' }),
+        completedBy: `+${resolvedPhone}`,
+        notes: 'File cancelled / rejected at Tender Board'
+      });
+
+      await docRef.update({
+        currentStep: currentStep,
+        isCompleted: true,
+        isCancelled: true,
+        status: 'CANCELLED',
+        lastUpdatedDate: now,
+        history: history
+      });
+
+      await sock.sendMessage(remoteJid, {
+        text: `❌ *FILE CANCELLED / REJECTED*
+
+*File No – ${targetDemand.demandNumber}*
+
+${targetDemand.topic}
+
+✓ *Status* - Cancelled at ${currentStepInfo.title}.
+
+_This demand is now closed and removed from active tracking._`
+      });
+
       if (procQueue.length > 0 && procQueue[0].demandId === targetDemand.id) {
         procQueue.shift();
         await saveProcurementQueue(db, procQueue);
@@ -1843,9 +1903,9 @@ app.get('/procurement', async (req, res) => {
   }
 });
 
-// Daily Procurement Workflow Prompt Cron at 08:30 AM
-cron.schedule('30 8 * * *', () => {
-  console.log('⏰ [Daily Cron] Dispatching daily procurement workflow prompt (08:30 AM)...');
+// Daily Procurement Workflow Prompt Cron at 09:00 AM and 03:00 PM
+cron.schedule('0 9,15 * * *', () => {
+  console.log('⏰ [Daily Cron] Dispatching daily procurement workflow prompt (09:00 AM / 03:00 PM)...');
   const db = getDb();
   if (db) dispatchProcurementPrompt(db);
 }, { timezone: 'Asia/Colombo' });
